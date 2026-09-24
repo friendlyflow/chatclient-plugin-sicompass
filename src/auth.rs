@@ -40,7 +40,7 @@ impl ChatClientProvider {
                     result.next_stage,
                     result.session,
                 );
-                sicompass_sdk::platform::open_with_default(&fallback_url);
+                crate::files::open_url(&fallback_url);
             }
         } else {
             self.uia_session.clear();

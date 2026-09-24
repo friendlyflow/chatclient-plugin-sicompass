@@ -1,7 +1,10 @@
-//! Matrix /sync background thread.
+//! Matrix /sync in the background.
 //!
-//! Mirrors the structure of lib_emailclient/src/idle.rs — same AtomicBool
-//! wake mechanism, same non-blocking stop, same reconnect back-off.
+//! Inside the sandbox the long poll is a host task ([`SYNC_TASK`], a second
+//! instance of the plugin): it passes each response on with `tasks.emit`, and
+//! the UI instance merges it into the cache ([`SyncController::on_task_event`])
+//! and is the only one that writes the plugin's state file. Natively, for the
+//! tests, it is a thread with the same reconnect back-off.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -95,11 +98,11 @@ pub struct SyncCache {
 pub fn parse_sync_response(json: serde_json::Value, cache: &mut SyncCache) -> bool {
     let mut changed = false;
 
-    if let Some(nb) = json.get("next_batch").and_then(|v| v.as_str()) {
-        if cache.next_batch != nb {
-            cache.next_batch = nb.to_owned();
-            changed = true;
-        }
+    if let Some(nb) = json.get("next_batch").and_then(|v| v.as_str())
+        && cache.next_batch != nb
+    {
+        cache.next_batch = nb.to_owned();
+        changed = true;
     }
 
     // Parse m.direct from account_data first — rooms below need it to set is_dm.
@@ -133,10 +136,9 @@ pub fn parse_sync_response(json: serde_json::Value, cache: &mut SyncCache) -> bo
                                 .get("content")
                                 .and_then(|c| c.get("name"))
                                 .and_then(|n| n.as_str())
+                                && !name.is_empty()
                             {
-                                if !name.is_empty() {
-                                    display_name = name.to_owned();
-                                }
+                                display_name = name.to_owned();
                             }
                         }
                         "m.room.member"
@@ -299,10 +301,9 @@ pub fn parse_sync_response(json: serde_json::Value, cache: &mut SyncCache) -> bo
                     .get("timeline")
                     .and_then(|t| t.get("prev_batch"))
                     .and_then(|v| v.as_str())
+                    && entry.prev_batch.as_deref() != Some(pb)
                 {
-                    if entry.prev_batch.as_deref() != Some(pb) {
-                        entry.prev_batch = Some(pb.to_owned());
-                    }
+                    entry.prev_batch = Some(pb.to_owned());
                 }
             }
 
@@ -359,11 +360,11 @@ fn apply_state_event(
                 .get("content")
                 .and_then(|c| c.get("name"))
                 .and_then(|n| n.as_str())
+                && !name.is_empty()
+                && entry.display_name != name
             {
-                if !name.is_empty() && entry.display_name != name {
-                    entry.display_name = name.to_owned();
-                    *changed = true;
-                }
+                entry.display_name = name.to_owned();
+                *changed = true;
             }
         }
         "m.room.create" => {
@@ -372,11 +373,10 @@ fn apply_state_event(
                 .and_then(|c| c.get("type"))
                 .and_then(|t| t.as_str())
                 == Some("m.space")
+                && entry.kind != RoomKind::Space
             {
-                if entry.kind != RoomKind::Space {
-                    entry.kind = RoomKind::Space;
-                    *changed = true;
-                }
+                entry.kind = RoomKind::Space;
+                *changed = true;
             }
         }
         "m.space.child" => {
@@ -385,7 +385,7 @@ fn apply_state_event(
                 .get("content")
                 .and_then(|c| c.get("via"))
                 .and_then(|v| v.as_array())
-                .map_or(false, |a| !a.is_empty());
+                .is_some_and(|a| !a.is_empty());
             if is_active
                 && !child_id.is_empty()
                 && !entry.space_children.contains(&child_id.to_owned())
@@ -521,6 +521,7 @@ fn rebuild_display_map(cache: &mut SyncCache) {
 // SyncController
 // ---------------------------------------------------------------------------
 
+#[cfg(not(target_arch = "wasm32"))]
 pub struct SyncController {
     cache: Arc<Mutex<SyncCache>>,
     notify: Arc<AtomicBool>,
@@ -528,6 +529,7 @@ pub struct SyncController {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl SyncController {
     pub fn new(cache: Arc<Mutex<SyncCache>>, notify: Arc<AtomicBool>) -> Self {
         SyncController {
@@ -600,10 +602,149 @@ impl Drop for SyncController {
     }
 }
 
+/// The task that long-polls `/sync` in the sandbox.
+#[cfg(target_arch = "wasm32")]
+pub const SYNC_TASK: &str = "sync";
+
+/// The UI instance's side of the sync task.
+#[cfg(target_arch = "wasm32")]
+pub struct SyncController {
+    cache: Arc<Mutex<SyncCache>>,
+    notify: Arc<AtomicBool>,
+    task: Option<u64>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl SyncController {
+    pub fn new(cache: Arc<Mutex<SyncCache>>, notify: Arc<AtomicBool>) -> Self {
+        SyncController {
+            cache,
+            notify,
+            task: None,
+        }
+    }
+
+    /// Start (or restart) the sync task. The state file is the UI instance's
+    /// to write, so `config_path` and `file_lock` are not the task's.
+    pub fn start(
+        &mut self,
+        homeserver: String,
+        access_token: String,
+        _config_path: Option<std::path::PathBuf>,
+        user_id: String,
+        _file_lock: Arc<Mutex<()>>,
+    ) {
+        self.stop();
+        let since = {
+            let mut locked = lock(&self.cache);
+            if !user_id.is_empty() && locked.self_user_id.is_empty() {
+                locked.self_user_id = user_id;
+            }
+            locked.next_batch.clone()
+        };
+        let job = serde_json::json!({
+            "homeserver": homeserver,
+            "token": access_token,
+            "since": since,
+        });
+        match sicompass_pdk::tasks::spawn(SYNC_TASK, job.to_string().as_bytes()) {
+            Ok(id) => self.task = Some(id),
+            Err(e) => sicompass_pdk::host::log(&format!("chatclient: no sync task: {e}")),
+        }
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(id) = self.task.take() {
+            sicompass_pdk::tasks::cancel(id);
+        }
+    }
+
+    /// A response the task passed on, merged into the cache. Answers the
+    /// `next_batch` to save when it changed anything.
+    pub fn on_task_event(&mut self, id: u64, event: sicompass_pdk::TaskEvent) -> Option<String> {
+        if self.task != Some(id) {
+            return None;
+        }
+        match event {
+            sicompass_pdk::TaskEvent::Progress(bytes) => {
+                let body: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                let next_batch = body
+                    .get("next_batch")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                if parse_sync_response(body, &mut lock(&self.cache)) {
+                    self.notify.store(true, Ordering::Relaxed);
+                    return (!next_batch.is_empty()).then_some(next_batch);
+                }
+                None
+            }
+            sicompass_pdk::TaskEvent::Done(result) => {
+                if let Err(e) = result {
+                    sicompass_pdk::host::log(&format!("chatclient: sync ended: {e}"));
+                }
+                self.task = None;
+                None
+            }
+        }
+    }
+}
+
+/// The sync task itself, in the worker instance: long-poll until cancelled,
+/// passing each response on, and wait out a failure before trying again.
+#[cfg(target_arch = "wasm32")]
+pub fn run_sync_task(input: &[u8]) -> Result<Vec<u8>, String> {
+    use sicompass_pdk::tasks::{cancelled, emit};
+    let job: serde_json::Value = serde_json::from_slice(input).map_err(|e| e.to_string())?;
+    let field = |k: &str| job.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    let (homeserver, token, mut since) = (field("homeserver"), field("token"), field("since"));
+    let base = homeserver.trim_end_matches('/').to_owned();
+    let client = crate::http::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())?;
+    while !cancelled() {
+        let url = if since.is_empty() {
+            format!("{base}/_matrix/client/v3/sync?timeout=0")
+        } else {
+            format!("{base}/_matrix/client/v3/sync?since={since}&timeout=30000")
+        };
+        let answer = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .ok()
+            .filter(|r| r.status().is_success())
+            .and_then(|r| r.text().ok());
+        match answer {
+            Some(body) => {
+                if let Some(nb) = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v.get("next_batch")?.as_str().map(str::to_owned))
+                {
+                    since = nb;
+                }
+                emit(body.as_bytes());
+            }
+            None => {
+                for _ in 0..RECONNECT_DELAY_SECS {
+                    if cancelled() {
+                        return Ok(Vec::new());
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+        }
+    }
+    Ok(Vec::new())
+}
+
 // ---------------------------------------------------------------------------
 // Sync loop
 // ---------------------------------------------------------------------------
 
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)] // the thread's whole state, passed once
 fn sync_loop(
     homeserver: String,
     access_token: String,
@@ -643,6 +784,8 @@ fn sync_loop(
 
 /// Build the HTTP client once, then loop over /sync calls until an error or
 /// the running flag is cleared.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)] // the thread's whole state, passed once
 fn run_sync_session(
     homeserver: &str,
     access_token: &str,
@@ -655,14 +798,13 @@ fn run_sync_session(
 ) -> Result<(), String> {
     // Seed self_user_id into the cache if provided.
     if !user_id.is_empty() {
-        let mut locked = lock(&cache);
+        let mut locked = lock(cache);
         if locked.self_user_id.is_empty() {
             locked.self_user_id = user_id.to_owned();
         }
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("sicompass/1.0")
+    let client = crate::http::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|e| e.to_string())?;
@@ -674,7 +816,7 @@ fn run_sync_session(
             return Ok(());
         }
 
-        let since = lock(&cache).next_batch.clone();
+        let since = lock(cache).next_batch.clone();
         let url = if since.is_empty() {
             format!("{base}/_matrix/client/v3/sync?timeout=0")
         } else {
@@ -699,7 +841,7 @@ fn run_sync_session(
             .to_owned();
 
         let changed = {
-            let mut locked = lock(&cache);
+            let mut locked = lock(cache);
             parse_sync_response(body, &mut locked)
         };
 
@@ -712,6 +854,7 @@ fn run_sync_session(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Write `next_batch` into settings.json under `"chat client"."chatSyncNextBatch"`.
 ///
 /// `file_lock` must be the same mutex used by `save_setting` on the main thread
@@ -749,7 +892,7 @@ fn persist_next_batch(
     if let Ok(json) = serde_json::to_string_pretty(&Value::Object(root)) {
         // Atomic write (temp + rename) so concurrent readers never observe a
         // truncated file mid-write.
-        let _ = sicompass_sdk::platform::atomic_write(path, &json);
+        let _ = crate::files::atomic_write(path, &json);
     }
 }
 
@@ -940,8 +1083,10 @@ mod tests {
 
     #[test]
     fn parse_sync_response_returns_false_when_nothing_new() {
-        let mut cache = SyncCache::default();
-        cache.next_batch = "s1".to_owned();
+        let mut cache = SyncCache {
+            next_batch: "s1".to_owned(),
+            ..Default::default()
+        };
         cache.rooms.insert(
             "!r:s".to_owned(),
             RoomState {
@@ -1030,8 +1175,10 @@ mod tests {
 
     #[test]
     fn parse_sync_response_captures_inviter() {
-        let mut cache = SyncCache::default();
-        cache.self_user_id = "@bob:server".to_owned();
+        let mut cache = SyncCache {
+            self_user_id: "@bob:server".to_owned(),
+            ..Default::default()
+        };
         let json = serde_json::json!({
             "next_batch": "s1",
             "rooms": {

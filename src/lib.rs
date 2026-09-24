@@ -27,36 +27,27 @@
 //!
 //! ## Configuration
 //!
-//! Set via `on_setting_change` from the settings provider:
+//! The settings `plugin.json` declares, read at `init` and on change:
 //! - `chatHomeserver`   — Matrix homeserver URL
 //! - `chatAccessToken`  — Bearer access token
 //! - `chatUsername`     — Username (for login/register)
-//! - `chatUserId`       — Our own MXID (set on login/register, used for m.direct)
-//! Note: `chatPassword` is intentionally NOT persisted to disk.
+//!
+//! A sign-in's token and user id (`chatUserId`, used for m.direct) are kept in
+//! the plugin's storage folder, and take over from the settings. `chatPassword`
+//! is intentionally never written anywhere.
 
 mod auth;
+mod files;
+mod http;
+mod localize;
 mod members;
 mod messages;
 mod rooms;
 mod sync;
 
-use sicompass_sdk::ffon::FfonElement;
-use sicompass_sdk::localize;
-use sicompass_sdk::provider::Provider;
-use sicompass_sdk::timeline::{ChatOpKind, TimelineEntry};
-use std::sync::OnceLock as TranslationsOnce;
+use sicompass_pdk::{Descriptor, FfonElement, Plugin, PollResult, ProviderOp, export_plugin};
+use sicompass_sdk::timeline::ChatOpKind;
 
-/// Register this crate's translation bundles with the SDK localizer.
-/// Idempotent.
-pub fn register_translations() {
-    static ONCE: TranslationsOnce<()> = TranslationsOnce::new();
-    ONCE.get_or_init(|| {
-        let _ = localize::register_bundle("en-US", include_str!("../locales/en-US.ftl"));
-        let _ = localize::register_bundle("nl-BE", include_str!("../locales/nl-BE.ftl"));
-        let _ = localize::register_bundle("fr-BE", include_str!("../locales/fr-BE.ftl"));
-        let _ = localize::register_bundle("de-BE", include_str!("../locales/de-BE.ftl"));
-    });
-}
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -88,35 +79,35 @@ struct AuthResult {
 fn parse_auth_response(resp: serde_json::Value) -> AuthResult {
     let mut result = AuthResult::default();
 
-    if let (Some(session_val), Some(flows_val)) = (resp.get("session"), resp.get("flows")) {
-        if let Some(session) = session_val.as_str() {
-            result.requires_auth = true;
-            result.session = session.to_owned();
+    if let (Some(session_val), Some(flows_val)) = (resp.get("session"), resp.get("flows"))
+        && let Some(session) = session_val.as_str()
+    {
+        result.requires_auth = true;
+        result.session = session.to_owned();
 
-            let completed_count = resp
-                .get("completed")
-                .and_then(|c| c.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
+        let completed_count = resp
+            .get("completed")
+            .and_then(|c| c.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
 
-            if let Some(stage) = flows_val
-                .as_array()
-                .and_then(|fs| fs.first())
-                .and_then(|f| f.get("stages"))
-                .and_then(|s| s.as_array())
-                .and_then(|stages| stages.get(completed_count))
-                .and_then(|s| s.as_str())
-            {
-                result.next_stage = stage.to_owned();
-            }
-
-            result.error = if result.next_stage.is_empty() {
-                "interactive auth required: unknown stage".to_owned()
-            } else {
-                format!("interactive auth required: {}", result.next_stage)
-            };
-            return result;
+        if let Some(stage) = flows_val
+            .as_array()
+            .and_then(|fs| fs.first())
+            .and_then(|f| f.get("stages"))
+            .and_then(|s| s.as_array())
+            .and_then(|stages| stages.get(completed_count))
+            .and_then(|s| s.as_str())
+        {
+            result.next_stage = stage.to_owned();
         }
+
+        result.error = if result.next_stage.is_empty() {
+            "interactive auth required: unknown stage".to_owned()
+        } else {
+            format!("interactive auth required: {}", result.next_stage)
+        };
+        return result;
     }
 
     if let Some(errcode) = resp.get("errcode").and_then(|v| v.as_str()) {
@@ -201,7 +192,7 @@ pub struct ChatClientProvider {
     drafts: HashMap<String, String>,
     /// Unified-timeline emission queue. Drained by the app via
     /// `take_timeline_entries` after each command.
-    pending_timeline_entries: Vec<TimelineEntry>,
+    pending_timeline_entries: Vec<ChatOpKind>,
 }
 
 impl ChatClientProvider {
@@ -235,11 +226,7 @@ impl ChatClientProvider {
     }
 
     fn push_chat_op(&mut self, kind: ChatOpKind) {
-        self.pending_timeline_entries.push(TimelineEntry::ChatOp {
-            provider_idx: 0, // patched by app on drain
-            id: sicompass_sdk::ffon::IdArray::new(),
-            op: kind,
-        });
+        self.pending_timeline_entries.push(kind);
     }
 
     pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
@@ -255,7 +242,7 @@ impl ChatClientProvider {
     fn config_path(&self) -> Option<std::path::PathBuf> {
         self.config_path_override
             .clone()
-            .or_else(|| sicompass_sdk::platform::main_config_path())
+            .or_else(default_state_path)
     }
 
     fn cache(&self) -> std::sync::MutexGuard<'_, sync::SyncCache> {
@@ -290,11 +277,11 @@ impl ChatClientProvider {
             m.insert(key.to_owned(), Value::String(value.to_owned()));
         }
         if let Some(parent) = path.parent() {
-            sicompass_sdk::platform::make_dirs(parent);
+            files::make_dirs(parent);
         }
         if let Ok(json) = serde_json::to_string_pretty(&Value::Object(root)) {
             // Atomic write so concurrent readers never see a truncated file.
-            let _ = sicompass_sdk::platform::atomic_write(&path, &json);
+            let _ = files::atomic_write(&path, &json);
         }
     }
 
@@ -306,8 +293,8 @@ impl ChatClientProvider {
         self.save_setting("chatUserId", user_id);
     }
 
-    fn client(&self) -> Result<reqwest::blocking::Client, String> {
-        reqwest::blocking::Client::builder()
+    fn client(&self) -> Result<http::Client, String> {
+        http::Client::builder()
             .user_agent("sicompass/1.0")
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -838,220 +825,16 @@ impl Default for ChatClientProvider {
     }
 }
 
-#[async_trait::async_trait]
-impl Provider for ChatClientProvider {
-    fn name(&self) -> &str {
+// ---------------------------------------------------------------------------
+// What the plugin trait does not have, in the shape the tests drive it.
+// ---------------------------------------------------------------------------
+
+impl ChatClientProvider {
+    pub fn name(&self) -> &str {
         "chatclient"
     }
-    fn display_name(&self) -> String {
-        register_translations();
+    pub fn display_name(&self) -> String {
         localize::t("chatclient-display-name")
-    }
-    fn stable_root_key(&self) -> bool {
-        false
-    }
-
-    fn init(&mut self) {
-        use serde_json::Value;
-        let Some(path) = self.config_path() else {
-            self.maybe_start_sync();
-            return;
-        };
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            self.maybe_start_sync();
-            return;
-        };
-        let Ok(root) = serde_json::from_str::<Value>(&content) else {
-            self.maybe_start_sync();
-            return;
-        };
-        let Some(section) = root.get("chat client").and_then(|v| v.as_object()) else {
-            self.maybe_start_sync();
-            return;
-        };
-
-        macro_rules! load_str {
-            ($key:literal, $field:expr_2021) => {
-                if let Some(v) = section.get($key).and_then(|v| v.as_str()) {
-                    if !v.is_empty() {
-                        $field = v.to_owned();
-                    }
-                }
-            };
-        }
-
-        load_str!("chatHomeserver", self.homeserver);
-        load_str!("chatAccessToken", self.access_token);
-        load_str!("chatUsername", self.username);
-        load_str!("chatEmail", self.email);
-        load_str!("chatUserId", self.user_id);
-        // register_mode stays false (login form) unless the user has no token and
-        // explicitly ran :register — we don't override it from settings.
-
-        // Do NOT restore chatSyncNextBatch — resuming from a stored token causes
-        // the sync thread to only fetch events newer than that token, leaving room
-        // timelines empty (no visible messages) when the app restarts in a quiet room.
-        // Every session starts with a fresh initial sync (?timeout=0, no since) which
-        // returns the current room list plus a bounded recent-message history.
-
-        self.maybe_start_sync();
-    }
-
-    fn cleanup(&mut self) {
-        self.sync_controller.stop();
-        *self.cache() = sync::SyncCache::default();
-    }
-
-    fn needs_refresh(&self) -> bool {
-        self.needs_refresh_flag.load(Ordering::Relaxed)
-    }
-
-    fn clear_needs_refresh(&mut self) {
-        self.needs_refresh_flag.store(false, Ordering::Relaxed);
-    }
-
-    fn fetch(&mut self) -> Vec<FfonElement> {
-        let segs = self.current_path_segments();
-        match segs.len() {
-            0 => self.fetch_joined_rooms(),
-            1 => {
-                let seg = segs.into_iter().next().unwrap();
-                if seg.starts_with("[space] ") {
-                    self.fetch_space_children(&seg)
-                } else if seg == "[public]" {
-                    self.fetch_public_rooms_list()
-                } else {
-                    self.fetch_room_messages(&seg)
-                }
-            }
-            2 => {
-                let mut it = segs.into_iter();
-                let first = it.next().unwrap();
-                let second = it.next().unwrap();
-                if second == "[members]" {
-                    self.fetch_members(&first)
-                } else if first == "[public]" {
-                    self.fetch_public_room_detail(&second)
-                } else if first.starts_with("[space] ") {
-                    // Child room inside a space.
-                    self.fetch_room_messages(&second)
-                } else {
-                    vec![FfonElement::new_str("navigation error".to_owned())]
-                }
-            }
-            _ => vec![FfonElement::new_str("navigation error".to_owned())],
-        }
-    }
-
-    fn push_path(&mut self, segment: &str) {
-        let segment = strip_room_badge(segment);
-        if self.current_path == "/" {
-            self.current_path = format!("/{segment}");
-        } else {
-            self.current_path = format!("{}/{segment}", self.current_path);
-        }
-    }
-
-    fn pop_path(&mut self) {
-        match self.current_path.rfind('/') {
-            Some(0) | None => self.current_path = "/".to_owned(),
-            Some(pos) => self.current_path = self.current_path[..pos].to_owned(),
-        }
-    }
-
-    fn current_path(&self) -> &str {
-        &self.current_path
-    }
-
-    fn set_current_path(&mut self, path: &str) {
-        self.current_path = path.to_owned();
-    }
-
-    fn commit_edit(&mut self, _old: &str, new_content: &str) -> bool {
-        // Pending action (from a command that requested text input) takes priority.
-        if let Some(action) = self.pending_action.take() {
-            let mut err = String::new();
-            let ok = self.execute_pending_action(action, new_content, &mut err);
-            return ok;
-        }
-
-        let segs = self.current_path_segments();
-        let Some(first) = segs.first().cloned() else {
-            return false;
-        };
-
-        // Form field edit (login or register form) — path segment is the field label.
-        if self.access_token.is_empty() {
-            return match first.as_str() {
-                "Homeserver" => {
-                    self.homeserver = new_content.to_owned();
-                    self.save_setting("chatHomeserver", new_content);
-                    true
-                }
-                "Username" => {
-                    self.username = new_content.to_owned();
-                    self.save_setting("chatUsername", new_content);
-                    true
-                }
-                "Email" if self.register_mode => {
-                    self.email = new_content.to_owned();
-                    self.save_setting("chatEmail", new_content);
-                    true
-                }
-                "Password" => {
-                    self.password = new_content.to_owned();
-                    true
-                }
-                _ => false,
-            };
-        }
-
-        // Inside a room at depth 1: send message if the segment resolves to a room.
-        if segs.len() == 1 {
-            let exists = self.cache().display_to_id.contains_key(&first);
-            if exists {
-                let ok = self.send_message(&first, new_content);
-                if ok {
-                    self.drafts.remove(&first);
-                } else {
-                    self.last_error = Some("send failed — message saved as draft".to_owned());
-                    self.drafts.insert(first, new_content.to_owned());
-                }
-                return ok;
-            }
-        }
-
-        false
-    }
-
-    fn commands(&self) -> Vec<String> {
-        vec![
-            "send message".to_owned(),
-            "refresh".to_owned(),
-            "login".to_owned(),
-            "register".to_owned(),
-            "complete registration".to_owned(),
-            "join room".to_owned(),
-            "create private room".to_owned(),
-            "create public room".to_owned(),
-            "create encrypted room".to_owned(),
-            "create space".to_owned(),
-            "create dm".to_owned(),
-            "room info".to_owned(),
-            "invite user".to_owned(),
-            "leave room".to_owned(),
-            "accept invite".to_owned(),
-            "reject invite".to_owned(),
-            "browse public rooms".to_owned(),
-            "search public rooms".to_owned(),
-            "join public room".to_owned(),
-            "members".to_owned(),
-            "kick member".to_owned(),
-            "ban member".to_owned(),
-            "unban member".to_owned(),
-            "load earlier messages".to_owned(),
-            "mark read".to_owned(),
-        ]
     }
 
     fn handle_command(
@@ -1061,7 +844,6 @@ impl Provider for ChatClientProvider {
         _elem_type: i32,
         error: &mut String,
     ) -> Option<FfonElement> {
-        register_translations();
         match cmd {
             "send message" => Some(FfonElement::new_str("<input></input>".to_owned())),
 
@@ -1135,7 +917,7 @@ impl Provider for ChatClientProvider {
                             result.next_stage,
                             result.session,
                         );
-                        sicompass_sdk::platform::open_with_default(&fallback_url);
+                        files::open_url(&fallback_url);
                     }
                     Some(FfonElement::new_str(format!(
                         "complete {} in browser, then run complete registration",
@@ -1177,7 +959,7 @@ impl Provider for ChatClientProvider {
                             result.next_stage,
                             result.session,
                         );
-                        sicompass_sdk::platform::open_with_default(&fallback_url);
+                        files::open_url(&fallback_url);
                     }
                     Some(FfonElement::new_str(format!(
                         "complete {} in browser, then run complete registration",
@@ -1586,25 +1368,8 @@ impl Provider for ChatClientProvider {
         }
     }
 
-    fn on_button_press(&mut self, function_name: &str) {
-        self.on_button_press(function_name);
-    }
-
-    fn take_error(&mut self) -> Option<String> {
-        self.take_error()
-    }
-
-    fn take_timeline_entries(&mut self) -> Vec<TimelineEntry> {
-        std::mem::take(&mut self.pending_timeline_entries)
-    }
-
-    async fn undo(&mut self, entry: &TimelineEntry, error: &mut String) {
-        tokio::task::block_in_place(move || {
-            register_translations();
-            let op = match entry {
-                TimelineEntry::ChatOp { op, .. } => op,
-                _ => return,
-            };
+    fn undo_op(&mut self, op: &ChatOpKind, error: &mut String) {
+        {
             let result = match op {
                 ChatOpKind::LeaveRoom { room_id } => self.do_join(room_id).map(|_| ()),
                 ChatOpKind::AcceptInvite { room_id } | ChatOpKind::RejectInvite { room_id } => {
@@ -1627,16 +1392,11 @@ impl Provider for ChatClientProvider {
                 args.set("err", e.to_string());
                 *error = localize::t_args("chatclient-error-undo-failed", &args);
             }
-        });
+        }
     }
 
-    async fn redo(&mut self, entry: &TimelineEntry, error: &mut String) {
-        tokio::task::block_in_place(move || {
-            register_translations();
-            let op = match entry {
-                TimelineEntry::ChatOp { op, .. } => op,
-                _ => return,
-            };
+    fn redo_op(&mut self, op: &ChatOpKind, error: &mut String) {
+        {
             let result = match op {
                 ChatOpKind::LeaveRoom { room_id } => self.do_leave(room_id),
                 ChatOpKind::AcceptInvite { room_id } => self.do_join(room_id).map(|_| ()),
@@ -1661,7 +1421,327 @@ impl Provider for ChatClientProvider {
                 args.set("err", e.to_string());
                 *error = localize::t_args("chatclient-error-redo-failed", &args);
             }
-        });
+        }
+    }
+
+    /// Whether new messages are waiting to be shown (`poll` reports it).
+    #[cfg(test)]
+    fn needs_refresh(&self) -> bool {
+        self.needs_refresh_flag.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn clear_needs_refresh(&mut self) {
+        self.needs_refresh_flag.store(false, Ordering::Relaxed);
+    }
+
+    /// Undo a recorded action (the tests drive this directly).
+    #[cfg(test)]
+    fn undo(&mut self, entry: &ProviderOp, error: &mut String) {
+        if let Some(op) = decode_op(entry) {
+            self.undo_op(&op, error);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin impl
+// ---------------------------------------------------------------------------
+
+impl Plugin for ChatClientProvider {
+    fn new() -> Self {
+        ChatClientProvider::new()
+    }
+
+    fn describe(&self) -> Descriptor {
+        Descriptor {
+            name: self.name().to_owned(),
+            display_name: self.display_name(),
+            version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            ..Default::default()
+        }
+    }
+
+    /// The sync task's new messages ask for a refresh; errors are reported.
+    fn poll(&mut self) -> PollResult {
+        let p = self.current_path.as_str();
+        PollResult {
+            needs_refresh: self.needs_refresh_flag.swap(false, Ordering::Relaxed),
+            at_root: p.is_empty() || p == "/",
+            error: self.take_error(),
+            ..Default::default()
+        }
+    }
+
+    fn run_task(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, String> {
+        match name {
+            #[cfg(target_arch = "wasm32")]
+            sync::SYNC_TASK => sync::run_sync_task(input),
+            other => {
+                let _ = input;
+                Err(format!("chatclient has no task named `{other}`"))
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn on_task_event(&mut self, id: u64, event: sicompass_pdk::TaskEvent) {
+        if let Some(next_batch) = self.sync_controller.on_task_event(id, event) {
+            self.save_setting("chatSyncNextBatch", &next_batch);
+        }
+    }
+
+    fn handle_command(
+        &mut self,
+        cmd: &str,
+        elem_key: &str,
+        elem_type: i32,
+    ) -> Result<Option<FfonElement>, String> {
+        let mut error = String::new();
+        let out = ChatClientProvider::handle_command(self, cmd, elem_key, elem_type, &mut error);
+        if error.is_empty() {
+            Ok(out)
+        } else {
+            Err(error)
+        }
+    }
+
+    fn undo(&mut self, entry: &ProviderOp) -> Result<(), String> {
+        let mut error = String::new();
+        if let Some(op) = decode_op(entry) {
+            self.undo_op(&op, &mut error);
+        }
+        if error.is_empty() { Ok(()) } else { Err(error) }
+    }
+
+    fn redo(&mut self, entry: &ProviderOp) -> Result<(), String> {
+        let mut error = String::new();
+        if let Some(op) = decode_op(entry) {
+            self.redo_op(&op, &mut error);
+        }
+        if error.is_empty() { Ok(()) } else { Err(error) }
+    }
+
+    fn init(&mut self) {
+        use serde_json::Value;
+        // The settings `plugin.json` declares, from the host. What an earlier
+        // sign-in saved in the plugin's own file (below) takes over from them.
+        #[cfg(target_arch = "wasm32")]
+        for key in [
+            "chatHomeserver",
+            "chatAccessToken",
+            "chatUsername",
+            "chatPassword",
+            "chatEmail",
+        ] {
+            if let Some(v) = sicompass_pdk::host::get_setting(key)
+                && !v.is_empty()
+            {
+                self.on_setting_change(key, &v);
+            }
+        }
+        let Some(path) = self.config_path() else {
+            self.maybe_start_sync();
+            return;
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            self.maybe_start_sync();
+            return;
+        };
+        let Ok(root) = serde_json::from_str::<Value>(&content) else {
+            self.maybe_start_sync();
+            return;
+        };
+        let Some(section) = root.get("chat client").and_then(|v| v.as_object()) else {
+            self.maybe_start_sync();
+            return;
+        };
+
+        macro_rules! load_str {
+            ($key:literal, $field:expr_2021) => {
+                if let Some(v) = section.get($key).and_then(|v| v.as_str()) {
+                    if !v.is_empty() {
+                        $field = v.to_owned();
+                    }
+                }
+            };
+        }
+
+        load_str!("chatHomeserver", self.homeserver);
+        load_str!("chatAccessToken", self.access_token);
+        load_str!("chatUsername", self.username);
+        load_str!("chatEmail", self.email);
+        load_str!("chatUserId", self.user_id);
+        // register_mode stays false (login form) unless the user has no token and
+        // explicitly ran :register — we don't override it from settings.
+
+        // Do NOT restore chatSyncNextBatch — resuming from a stored token causes
+        // the sync thread to only fetch events newer than that token, leaving room
+        // timelines empty (no visible messages) when the app restarts in a quiet room.
+        // Every session starts with a fresh initial sync (?timeout=0, no since) which
+        // returns the current room list plus a bounded recent-message history.
+
+        self.maybe_start_sync();
+    }
+
+    fn cleanup(&mut self) {
+        self.sync_controller.stop();
+        *self.cache() = sync::SyncCache::default();
+    }
+
+    fn fetch(&mut self) -> Vec<FfonElement> {
+        let segs = self.current_path_segments();
+        match segs.len() {
+            0 => self.fetch_joined_rooms(),
+            1 => {
+                let seg = segs.into_iter().next().unwrap();
+                if seg.starts_with("[space] ") {
+                    self.fetch_space_children(&seg)
+                } else if seg == "[public]" {
+                    self.fetch_public_rooms_list()
+                } else {
+                    self.fetch_room_messages(&seg)
+                }
+            }
+            2 => {
+                let mut it = segs.into_iter();
+                let first = it.next().unwrap();
+                let second = it.next().unwrap();
+                if second == "[members]" {
+                    self.fetch_members(&first)
+                } else if first == "[public]" {
+                    self.fetch_public_room_detail(&second)
+                } else if first.starts_with("[space] ") {
+                    // Child room inside a space.
+                    self.fetch_room_messages(&second)
+                } else {
+                    vec![FfonElement::new_str("navigation error".to_owned())]
+                }
+            }
+            _ => vec![FfonElement::new_str("navigation error".to_owned())],
+        }
+    }
+
+    fn push_path(&mut self, segment: &str) {
+        let segment = strip_room_badge(segment);
+        if self.current_path == "/" {
+            self.current_path = format!("/{segment}");
+        } else {
+            self.current_path = format!("{}/{segment}", self.current_path);
+        }
+    }
+
+    fn pop_path(&mut self) {
+        match self.current_path.rfind('/') {
+            Some(0) | None => self.current_path = "/".to_owned(),
+            Some(pos) => self.current_path = self.current_path[..pos].to_owned(),
+        }
+    }
+
+    fn current_path(&self) -> &str {
+        &self.current_path
+    }
+
+    fn set_current_path(&mut self, path: &str) {
+        self.current_path = path.to_owned();
+    }
+
+    fn commit_edit(&mut self, _old: &str, new_content: &str) -> bool {
+        // Pending action (from a command that requested text input) takes priority.
+        if let Some(action) = self.pending_action.take() {
+            let mut err = String::new();
+            let ok = self.execute_pending_action(action, new_content, &mut err);
+            return ok;
+        }
+
+        let segs = self.current_path_segments();
+        let Some(first) = segs.first().cloned() else {
+            return false;
+        };
+
+        // Form field edit (login or register form) — path segment is the field label.
+        if self.access_token.is_empty() {
+            return match first.as_str() {
+                "Homeserver" => {
+                    self.homeserver = new_content.to_owned();
+                    self.save_setting("chatHomeserver", new_content);
+                    true
+                }
+                "Username" => {
+                    self.username = new_content.to_owned();
+                    self.save_setting("chatUsername", new_content);
+                    true
+                }
+                "Email" if self.register_mode => {
+                    self.email = new_content.to_owned();
+                    self.save_setting("chatEmail", new_content);
+                    true
+                }
+                "Password" => {
+                    self.password = new_content.to_owned();
+                    true
+                }
+                _ => false,
+            };
+        }
+
+        // Inside a room at depth 1: send message if the segment resolves to a room.
+        if segs.len() == 1 {
+            let exists = self.cache().display_to_id.contains_key(&first);
+            if exists {
+                let ok = self.send_message(&first, new_content);
+                if ok {
+                    self.drafts.remove(&first);
+                } else {
+                    self.last_error = Some("send failed — message saved as draft".to_owned());
+                    self.drafts.insert(first, new_content.to_owned());
+                }
+                return ok;
+            }
+        }
+
+        false
+    }
+
+    fn commands(&self) -> Vec<String> {
+        vec![
+            "send message".to_owned(),
+            "refresh".to_owned(),
+            "login".to_owned(),
+            "register".to_owned(),
+            "complete registration".to_owned(),
+            "join room".to_owned(),
+            "create private room".to_owned(),
+            "create public room".to_owned(),
+            "create encrypted room".to_owned(),
+            "create space".to_owned(),
+            "create dm".to_owned(),
+            "room info".to_owned(),
+            "invite user".to_owned(),
+            "leave room".to_owned(),
+            "accept invite".to_owned(),
+            "reject invite".to_owned(),
+            "browse public rooms".to_owned(),
+            "search public rooms".to_owned(),
+            "join public room".to_owned(),
+            "members".to_owned(),
+            "kick member".to_owned(),
+            "ban member".to_owned(),
+            "unban member".to_owned(),
+            "load earlier messages".to_owned(),
+            "mark read".to_owned(),
+        ]
+    }
+
+    fn on_button_press(&mut self, function_name: &str) {
+        self.on_button_press(function_name);
+    }
+
+    fn take_timeline_entries(&mut self) -> Vec<ProviderOp> {
+        std::mem::take(&mut self.pending_timeline_entries)
+            .iter()
+            .map(encode_op)
+            .collect()
     }
 
     fn create_file(&mut self, name: &str) -> bool {
@@ -1679,6 +1759,95 @@ impl Provider for ChatClientProvider {
         self.on_setting_change(key, value);
     }
 }
+
+/// Where the sign-in and the sync position are kept: the plugin's storage
+/// folder (`permissions.storage`), in the shape of a settings file with one
+/// `chat client` section. Natively (the tests) nowhere unless a test names one.
+fn default_state_path() -> Option<std::path::PathBuf> {
+    if cfg!(target_arch = "wasm32") {
+        Some(std::path::PathBuf::from(sicompass_pdk::STORAGE_DIR).join("chat.json"))
+    } else {
+        None
+    }
+}
+
+/// A recorded action as the provider op the app keeps on its timeline: the
+/// variant's name, and its fields as an FFON list.
+fn encode_op(op: &ChatOpKind) -> ProviderOp {
+    let (command, parts): (&str, Vec<&str>) = match op {
+        ChatOpKind::LeaveRoom { room_id } => ("leave-room", vec![room_id]),
+        ChatOpKind::AcceptInvite { room_id } => ("accept-invite", vec![room_id]),
+        ChatOpKind::RejectInvite { room_id } => ("reject-invite", vec![room_id]),
+        ChatOpKind::KickMember {
+            room_id,
+            user_id,
+            reason,
+        } => (
+            "kick-member",
+            vec![room_id, user_id, reason.as_deref().unwrap_or("")],
+        ),
+        ChatOpKind::BanMember {
+            room_id,
+            user_id,
+            reason,
+        } => (
+            "ban-member",
+            vec![room_id, user_id, reason.as_deref().unwrap_or("")],
+        ),
+        ChatOpKind::PostMessage {
+            room_id,
+            event_id,
+            body,
+        } => ("post-message", vec![room_id, event_id, body]),
+    };
+    let mut payload = FfonElement::new_obj(command);
+    if let Some(o) = payload.as_obj_mut() {
+        for part in parts {
+            o.push(FfonElement::new_str(part.to_owned()));
+        }
+    }
+    ProviderOp {
+        command: command.to_owned(),
+        payload: sicompass_pdk::encode_one(&payload),
+        label: command.replace('-', " "),
+    }
+}
+
+/// The inverse of [`encode_op`]; `None` for an entry that is not one.
+fn decode_op(entry: &ProviderOp) -> Option<ChatOpKind> {
+    let payload = sicompass_pdk::decode_one(&entry.payload)?;
+    let parts: Vec<String> = payload
+        .as_obj()?
+        .children
+        .iter()
+        .filter_map(|c| c.as_str().map(str::to_owned))
+        .collect();
+    let at = |i: usize| parts.get(i).cloned().unwrap_or_default();
+    let reason = || Some(at(2)).filter(|r| !r.is_empty());
+    Some(match entry.command.as_str() {
+        "leave-room" => ChatOpKind::LeaveRoom { room_id: at(0) },
+        "accept-invite" => ChatOpKind::AcceptInvite { room_id: at(0) },
+        "reject-invite" => ChatOpKind::RejectInvite { room_id: at(0) },
+        "kick-member" => ChatOpKind::KickMember {
+            room_id: at(0),
+            user_id: at(1),
+            reason: reason(),
+        },
+        "ban-member" => ChatOpKind::BanMember {
+            room_id: at(0),
+            user_id: at(1),
+            reason: reason(),
+        },
+        "post-message" => ChatOpKind::PostMessage {
+            room_id: at(0),
+            event_id: at(1),
+            body: at(2),
+        },
+        _ => return None,
+    })
+}
+
+export_plugin!(ChatClientProvider);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1774,11 +1943,11 @@ impl ChatClientProvider {
     /// Set unread/mention counts on a previously-seeded room (by display name).
     pub fn test_set_unread(&mut self, display_name: &str, unread: u32, highlight: u32) {
         let mut cache = self.sync_cache.lock().unwrap();
-        if let Some(room_id) = cache.display_to_id.get(display_name).cloned() {
-            if let Some(room) = cache.rooms.get_mut(&room_id) {
-                room.unread_count = unread;
-                room.highlight_count = highlight;
-            }
+        if let Some(room_id) = cache.display_to_id.get(display_name).cloned()
+            && let Some(room) = cache.rooms.get_mut(&room_id)
+        {
+            room.unread_count = unread;
+            room.highlight_count = highlight;
         }
         // Mark next_batch non-empty so fetch() doesn't show "Loading…".
         if cache.next_batch.is_empty() {
@@ -1868,7 +2037,7 @@ mod tests {
         let items = p.fetch();
         assert!(items.iter().any(|e| {
             e.as_str()
-                .map_or(false, |s| s.contains("<button>login</button>"))
+                .is_some_and(|s| s.contains("<button>login</button>"))
         }));
     }
 
@@ -1880,7 +2049,7 @@ mod tests {
         let items = p.fetch();
         assert!(items.iter().any(|e| {
             e.as_str()
-                .map_or(false, |s| s.contains("<input>alice</input>"))
+                .is_some_and(|s| s.contains("<input>alice</input>"))
         }));
     }
 
@@ -1892,7 +2061,7 @@ mod tests {
         let items = p.fetch();
         assert!(items.iter().any(|e| {
             e.as_str()
-                .map_or(false, |s| s.contains("<button>login</button>"))
+                .is_some_and(|s| s.contains("<button>login</button>"))
         }));
     }
 
@@ -1906,7 +2075,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| { e.as_str().map_or(false, |s| s.contains("no rooms found")) })
+                .any(|e| { e.as_str().is_some_and(|s| s.contains("no rooms found")) })
         );
     }
 
@@ -1920,7 +2089,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.is_obj() && e.as_obj().map_or(false, |o| o.key != "meta"))
+                .any(|e| e.is_obj() && e.as_obj().is_some_and(|o| o.key != "meta"))
         );
     }
 
@@ -1934,7 +2103,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| { e.as_obj().map_or(false, |o| o.key == "General") })
+                .any(|e| { e.as_obj().is_some_and(|o| o.key == "General") })
         );
     }
 
@@ -2009,7 +2178,7 @@ mod tests {
         p.push_path("General");
         let items = p.fetch();
         let last = items.last().unwrap();
-        assert!(last.as_str().map_or(false, |s| s.contains("<input>")));
+        assert!(last.as_str().is_some_and(|s| s.contains("<input>")));
     }
 
     #[test]
@@ -2023,7 +2192,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key == "[members]"))
+                .any(|e| e.as_obj().is_some_and(|o| o.key == "[members]"))
         );
     }
 
@@ -2037,7 +2206,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| { e.as_str().map_or(false, |s| s.contains("room not found")) })
+                .any(|e| { e.as_str().is_some_and(|s| s.contains("room not found")) })
         );
     }
 
@@ -2217,7 +2386,7 @@ mod tests {
             result
                 .unwrap()
                 .as_str()
-                .map_or(false, |s| s.contains("<input>"))
+                .is_some_and(|s| s.contains("<input>"))
         );
     }
 
@@ -2248,7 +2417,7 @@ mod tests {
         assert!(
             elem.unwrap()
                 .as_str()
-                .map_or(false, |s| s.contains("@alice:server.org"))
+                .is_some_and(|s| s.contains("@alice:server.org"))
         );
         assert_eq!(p.user_id, "@alice:server.org");
         drop(rt);
@@ -2307,7 +2476,7 @@ mod tests {
         assert!(
             elem.unwrap()
                 .as_str()
-                .map_or(false, |s| s.contains("@newuser:server.org"))
+                .is_some_and(|s| s.contains("@newuser:server.org"))
         );
         assert_eq!(p.access_token, "reg_token_abc");
         assert!(p.uia_session.is_empty());
@@ -2343,7 +2512,7 @@ mod tests {
         assert!(
             elem.unwrap()
                 .as_str()
-                .map_or(false, |s| s.contains("m.login.recaptcha"))
+                .is_some_and(|s| s.contains("m.login.recaptcha"))
         );
         assert_eq!(p.uia_session, "uia_session_xyz");
         drop(rt);
@@ -2389,7 +2558,7 @@ mod tests {
         assert!(
             elem.unwrap()
                 .as_str()
-                .map_or(false, |s| s.contains("@alice:server.org"))
+                .is_some_and(|s| s.contains("@alice:server.org"))
         );
         assert_eq!(p.access_token, "final_token");
         assert!(p.uia_session.is_empty());
@@ -2531,7 +2700,7 @@ mod tests {
         let items = p.fetch();
         assert!(items.iter().any(|e| {
             e.as_str()
-                .map_or(false, |s| s.contains("<button>login</button>"))
+                .is_some_and(|s| s.contains("<button>login</button>"))
         }));
     }
 
@@ -2655,7 +2824,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| { e.as_str().map_or(false, |s| s.contains("Loading")) })
+                .any(|e| { e.as_str().is_some_and(|s| s.contains("Loading")) })
         );
     }
 
@@ -2663,10 +2832,11 @@ mod tests {
     fn register_form_prefills_homeserver_default() {
         let mut p = ChatClientProvider::new();
         let items = p.fetch();
-        assert!(items.iter().any(|e| {
-            e.as_str()
-                .map_or(false, |s| s.contains("https://matrix.org"))
-        }));
+        assert!(
+            items
+                .iter()
+                .any(|e| { e.as_str().is_some_and(|s| s.contains("https://matrix.org")) })
+        );
     }
 
     #[test]
@@ -2676,12 +2846,12 @@ mod tests {
         let items = p.fetch();
         let inputs = items
             .iter()
-            .filter(|e| e.as_str().map_or(false, |s| s.contains("<input>")))
+            .filter(|e| e.as_str().is_some_and(|s| s.contains("<input>")))
             .count();
         assert_eq!(inputs, 4);
         assert!(items.iter().any(|e| {
             e.as_str()
-                .map_or(false, |s| s.contains("<button>register</button>"))
+                .is_some_and(|s| s.contains("<button>register</button>"))
         }));
     }
 
@@ -2694,12 +2864,11 @@ mod tests {
         let items = p.fetch();
         assert!(items.iter().any(|e| {
             e.as_str()
-                .map_or(false, |s| s.contains("<input>friendlyflow</input>"))
+                .is_some_and(|s| s.contains("<input>friendlyflow</input>"))
         }));
         assert!(items.iter().any(|e| {
-            e.as_str().map_or(false, |s| {
-                s.contains("<input>2friendlyflow@gmail.com</input>")
-            })
+            e.as_str()
+                .is_some_and(|s| s.contains("<input>2friendlyflow@gmail.com</input>"))
         }));
     }
 
@@ -2710,9 +2879,8 @@ mod tests {
         p.uia_session = "sess123".to_owned();
         let items = p.fetch();
         assert!(items.iter().any(|e| {
-            e.as_str().map_or(false, |s| {
-                s.contains("<button>complete-registration</button>")
-            })
+            e.as_str()
+                .is_some_and(|s| s.contains("<button>complete-registration</button>"))
         }));
     }
 
@@ -2825,9 +2993,8 @@ mod tests {
         assert_eq!(p.uia_session, "uia_sess");
         let items = p.fetch();
         assert!(items.iter().any(|e| {
-            e.as_str().map_or(false, |s| {
-                s.contains("<button>complete-registration</button>")
-            })
+            e.as_str()
+                .is_some_and(|s| s.contains("<button>complete-registration</button>"))
         }));
         drop(rt);
     }
@@ -2846,7 +3013,7 @@ mod tests {
         assert!(
             elem.unwrap()
                 .as_str()
-                .map_or(false, |s| s.contains("<input>"))
+                .is_some_and(|s| s.contains("<input>"))
         );
         assert!(p.pending_action.is_some());
     }
@@ -3167,7 +3334,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key == "general"))
+                .any(|e| e.as_obj().is_some_and(|o| o.key == "general"))
         );
     }
 
@@ -3206,7 +3373,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_obj().map_or(false, |o| o.key.contains("@alice:s")))
+                .any(|e| e.as_obj().is_some_and(|o| o.key.contains("@alice:s")))
         );
     }
 
@@ -3263,7 +3430,7 @@ mod tests {
         let items = p.fetch();
         let room = items
             .iter()
-            .find(|e| e.as_obj().map_or(false, |o| o.key == "Noisy [unread:7]"));
+            .find(|e| e.as_obj().is_some_and(|o| o.key == "Noisy [unread:7]"));
         assert!(room.is_some(), "room with badge in key must appear in list");
         assert!(
             room.unwrap().as_obj().unwrap().children.is_empty(),
@@ -3316,7 +3483,7 @@ mod tests {
         let items = p.fetch();
         let input = items
             .iter()
-            .find(|e| e.as_str().map_or(false, |s| s.contains("<input>")));
+            .find(|e| e.as_str().is_some_and(|s| s.contains("<input>")));
         assert!(input.is_some(), "input bar must be present");
         assert!(
             input.unwrap().as_str().unwrap().contains("hello draft"),
@@ -3341,7 +3508,7 @@ mod tests {
         let ok = p.commit_edit("", "Hello!");
         assert!(ok, "send must succeed");
         assert!(
-            p.drafts.get("General").is_none(),
+            !p.drafts.contains_key("General"),
             "draft must be cleared after successful send"
         );
         drop(rt);
@@ -3362,13 +3529,13 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_str().map_or(false, |s| s.contains("!abc:matrix.org"))),
+                .any(|e| e.as_str().is_some_and(|s| s.contains("!abc:matrix.org"))),
             "must show room_id"
         );
         assert!(
             items.iter().any(|e| e
                 .as_str()
-                .map_or(false, |s| s.contains("<button>join-public-room</button>"))),
+                .is_some_and(|s| s.contains("<button>join-public-room</button>"))),
             "must show join button"
         );
     }
@@ -3383,7 +3550,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|e| e.as_str().map_or(false, |s| s.contains("not found")))
+                .any(|e| e.as_str().is_some_and(|s| s.contains("not found")))
         );
     }
 
@@ -3408,11 +3575,8 @@ mod tests {
         p.handle_command("leave room", "", 0, &mut err);
         let entries = p.take_timeline_entries();
         assert_eq!(entries.len(), 1, "one ChatOp emitted");
-        match &entries[0] {
-            TimelineEntry::ChatOp {
-                op: ChatOpKind::LeaveRoom { room_id },
-                ..
-            } => {
+        match decode_op(&entries[0]) {
+            Some(ChatOpKind::LeaveRoom { room_id }) => {
                 assert_eq!(room_id, "!abc:x");
             }
             other => panic!("expected ChatOp::LeaveRoom, got {:?}", other),
@@ -3452,8 +3616,8 @@ mod tests {
         let entries = p.take_timeline_entries();
         assert_eq!(entries.len(), 1);
         assert!(matches!(
-            &entries[0],
-            TimelineEntry::ChatOp { op: ChatOpKind::AcceptInvite { room_id }, .. } if room_id == "!inv:x"
+            decode_op(&entries[0]),
+            Some(ChatOpKind::AcceptInvite { room_id }) if room_id == "!inv:x"
         ));
         drop(rt);
     }
@@ -3476,47 +3640,106 @@ mod tests {
         // Track the call via an inline mock side effect — wiremock's `expect`
         // would also work but is heavier; we just assert end-state behavior.
         let mut p = provider_for(&server);
-        let entry = TimelineEntry::ChatOp {
-            provider_idx: 0,
-            id: sicompass_sdk::ffon::IdArray::new(),
-            op: ChatOpKind::LeaveRoom {
-                room_id: "!r:x".to_owned(),
-            },
-        };
+        let entry = encode_op(&ChatOpKind::LeaveRoom {
+            room_id: "!r:x".to_owned(),
+        });
         let mut err = String::new();
-        sicompass_sdk::block_on(p.undo(&entry, &mut err));
+        p.undo(&entry, &mut err);
         assert!(err.is_empty(), "undo error: {err}");
         // If do_join hit the endpoint without throwing, we're good. (The mock
         // returns 200, so any other error path would leave a non-empty `err`.)
         let _ = flag;
         drop(rt);
     }
-}
 
-// ---------------------------------------------------------------------------
-// SDK registration
-// ---------------------------------------------------------------------------
+    // ---- Moved from sicompass's integration tests, which cannot reach the
+    // test helpers of a plugin ----------------------------------------------
 
-/// Register the chat client with the SDK factory and manifest registries.
-pub fn register() {
-    sicompass_sdk::register_provider_factory("chatclient", || Box::new(ChatClientProvider::new()));
-    sicompass_sdk::register_builtin_manifest(
-        sicompass_sdk::BuiltinManifest::new("chatclient", "chat client").with_settings(vec![
-            sicompass_sdk::SettingDecl::text(
-                "chat client",
-                "homeserver URL",
-                "chatHomeserver",
-                "https://matrix.org",
-            ),
-            sicompass_sdk::SettingDecl::password(
-                "chat client",
-                "access token",
-                "chatAccessToken",
-                "",
-            ),
-            sicompass_sdk::SettingDecl::text("chat client", "username", "chatUsername", ""),
-            sicompass_sdk::SettingDecl::password("chat client", "password", "chatPassword", ""),
-            sicompass_sdk::SettingDecl::text("chat client", "email", "chatEmail", ""),
-        ]),
-    );
+    /// When a room has unread messages the badge must be embedded in the Obj's key
+    /// (not as a child). An obj with children is expanded in-place by the renderer
+    /// rather than triggering a provider fetch, which would prevent navigating into
+    /// the room.
+    #[test]
+    fn chat_unread_badge_embedded_in_key() {
+        let mut chat = ChatClientProvider::new().with_sync_disabled();
+        chat.test_set_credentials("https://matrix.org", "tok");
+
+        chat.test_seed_room("!noisy:s", "Noisy Channel");
+        chat.test_set_unread("Noisy Channel", 3, 1);
+
+        let children = chat.fetch();
+
+        // Badge is in the key; no child nodes.
+        let room_obj = children.iter().find(|e| {
+            e.as_obj()
+                .is_some_and(|o| o.key == "Noisy Channel [mention:1]")
+        });
+        assert!(
+            room_obj.is_some(),
+            "room with badge key must appear; got: {children:?}"
+        );
+        assert!(
+            room_obj.unwrap().as_obj().unwrap().children.is_empty(),
+            "room obj must have no children so navigation reaches the provider fetch"
+        );
+    }
+
+    /// The "room info" command must return a string that includes the room ID,
+    /// even without a live homeserver.  This confirms the provider wires topic/
+    /// member/encryption data through without touching the network.
+    #[test]
+    fn chat_room_info_returns_room_id() {
+        let mut chat = ChatClientProvider::new().with_sync_disabled();
+        chat.test_set_credentials("https://matrix.org", "tok");
+        chat.test_seed_room("!info:s", "Info Room");
+        // Navigate into the room so "room info" finds it.
+        chat.push_path("Info Room");
+
+        let mut err = String::new();
+        let result = chat.handle_command("room info", "Info Room", 0, &mut err);
+        assert!(err.is_empty(), "room info must not error: {err}");
+        assert!(result.is_some(), "room info must return a result element");
+        let text = result.unwrap();
+        assert!(
+            text.as_str().is_some_and(|s| s.contains("!info:s")),
+            "room info must contain the room ID; got: {text:?}"
+        );
+    }
+
+    /// "mark read" must clear the local unread count immediately (even if the
+    /// receipt HTTP call fails). The badge disappears from the room list after the
+    /// command runs.
+    #[test]
+    fn chat_mark_read_clears_local_unread_count() {
+        let mut chat = ChatClientProvider::new().with_sync_disabled();
+        // Unreachable server: the receipt POST will fail silently; the local
+        // optimistic update must still apply.
+        chat.test_set_credentials("http://127.0.0.1:1", "tok");
+        chat.test_seed_room("!r:s", "General");
+        chat.test_set_unread("General", 2, 0);
+
+        // Sanity: badge in room list before marking read.
+        let list_before = chat.fetch();
+        assert!(
+            list_before
+                .iter()
+                .any(|e| e.as_obj().is_some_and(|o| o.key == "General [unread:2]")),
+            "unread badge must be in key before mark read; got: {list_before:?}"
+        );
+
+        // Navigate into the room so the command knows which room to mark.
+        chat.push_path("General");
+        let mut err = String::new();
+        chat.handle_command("mark read", "", 0, &mut err);
+
+        // Navigate back to root and verify badge is gone.
+        chat.pop_path();
+        let list_after = chat.fetch();
+        assert!(
+            list_after
+                .iter()
+                .any(|e| e.as_obj().is_some_and(|o| o.key == "General")),
+            "badge must be gone after mark read; got: {list_after:?}"
+        );
+    }
 }

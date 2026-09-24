@@ -114,7 +114,7 @@ impl ChatClientProvider {
                 .filter(|e| !existing.contains(&e.event_id))
                 .collect();
             let mut new_tl = to_prepend;
-            new_tl.extend(room.timeline.drain(..));
+            new_tl.append(&mut room.timeline);
             room.timeline = new_tl;
             let max = sync::MAX_TIMELINE * 2;
             if room.timeline.len() > max {
