@@ -16,10 +16,9 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-# The guest kit and the FFON model. By git until sicompass-sdk 0.9 and
-# sicompass-pdk 0.6 are on crates.io; the pdk uses the SDK from the same rev.
-sicompass-pdk = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", rev = "4d71b14688f8fb8dae6159fb0a7819d5c397f66e" }
-sicompass-sdk = { git = "https://github.com/friendlyflow/sicompass-plugin-sdk", rev = "4d71b14688f8fb8dae6159fb0a7819d5c397f66e", default-features = false }
+# The guest kit and the FFON model, from crates.io.
+sicompass-pdk = "0.6.0"
+sicompass-sdk = { version = "0.9.0", default-features = false }
 # The Matrix client-server API is JSON.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -43,8 +42,8 @@ strip = true
 
 # Working on the SDK and this plugin together: uncomment, and comment it out
 # again before committing. With it live, a green build proves nothing about what
-# the pinned rev resolves to.
+# the published crates resolve to.
 #
-# [patch."https://github.com/friendlyflow/sicompass-plugin-sdk"]
+# [patch.crates-io]
 # sicompass-pdk = { path = "../sicompass-plugin-sdk/sicompass-pdk" }
 # sicompass-sdk = { path = "../sicompass-plugin-sdk" }
