@@ -1,4 +1,4 @@
-# chatclient_plugin_sicompass
+# chatclient-plugin-sicompass
 
 *Matrix chat, in Sicompass.*
 

@@ -1,9 +1,9 @@
 {
-  # chatclient_plugin_sicompass: a Matrix chat client, a sicompass WASM plugin. The
+  # chatclient-plugin-sicompass: a Matrix chat client, a sicompass WASM plugin. The
   # plugin is built for wasm32-wasip2, which nixpkgs' rustc
   # has no std for, so the toolchain comes from rust-overlay (as in
   # sicompass-plugin-sdk's flake). flake.lock pins it.
-  description = "chatclient_plugin_sicompass: a Matrix chat client, a sicompass WASM plugin";
+  description = "chatclient-plugin-sicompass: a Matrix chat client, a sicompass WASM plugin";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
