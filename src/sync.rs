@@ -1,10 +1,11 @@
 //! Matrix /sync in the background.
 //!
-//! Inside the sandbox the long poll is a host task ([`SYNC_TASK`], a second
-//! instance of the plugin): it passes each response on with `tasks.emit`, and
-//! the UI instance merges it into the cache ([`SyncController::on_task_event`])
-//! and is the only one that writes the plugin's state file. Natively, for the
-//! tests, it is a thread with the same reconnect back-off.
+//! The long poll runs on a thread of its own ([`SyncController`]), because a
+//! call from the app must answer within its 10-second deadline and a `/sync`
+//! waits up to 30 seconds. The thread merges each response into the shared
+//! cache, saves the sync position to the plugin's state file (under the same
+//! lock as the rest of the plugin's writes to it), and raises a flag that
+//! `poll` turns into a refresh. After a failure it waits before reconnecting.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -521,7 +522,6 @@ fn rebuild_display_map(cache: &mut SyncCache) {
 // SyncController
 // ---------------------------------------------------------------------------
 
-#[cfg(not(target_arch = "wasm32"))]
 pub struct SyncController {
     cache: Arc<Mutex<SyncCache>>,
     notify: Arc<AtomicBool>,
@@ -529,7 +529,6 @@ pub struct SyncController {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl SyncController {
     pub fn new(cache: Arc<Mutex<SyncCache>>, notify: Arc<AtomicBool>) -> Self {
         SyncController {
@@ -602,148 +601,10 @@ impl Drop for SyncController {
     }
 }
 
-/// The task that long-polls `/sync` in the sandbox.
-#[cfg(target_arch = "wasm32")]
-pub const SYNC_TASK: &str = "sync";
-
-/// The UI instance's side of the sync task.
-#[cfg(target_arch = "wasm32")]
-pub struct SyncController {
-    cache: Arc<Mutex<SyncCache>>,
-    notify: Arc<AtomicBool>,
-    task: Option<u64>,
-}
-
-#[cfg(target_arch = "wasm32")]
-impl SyncController {
-    pub fn new(cache: Arc<Mutex<SyncCache>>, notify: Arc<AtomicBool>) -> Self {
-        SyncController {
-            cache,
-            notify,
-            task: None,
-        }
-    }
-
-    /// Start (or restart) the sync task. The state file is the UI instance's
-    /// to write, so `config_path` and `file_lock` are not the task's.
-    pub fn start(
-        &mut self,
-        homeserver: String,
-        access_token: String,
-        _config_path: Option<std::path::PathBuf>,
-        user_id: String,
-        _file_lock: Arc<Mutex<()>>,
-    ) {
-        self.stop();
-        let since = {
-            let mut locked = lock(&self.cache);
-            if !user_id.is_empty() && locked.self_user_id.is_empty() {
-                locked.self_user_id = user_id;
-            }
-            locked.next_batch.clone()
-        };
-        let job = serde_json::json!({
-            "homeserver": homeserver,
-            "token": access_token,
-            "since": since,
-        });
-        match sicompass_pdk::tasks::spawn(SYNC_TASK, job.to_string().as_bytes()) {
-            Ok(id) => self.task = Some(id),
-            Err(e) => sicompass_pdk::host::log(&format!("chatclient: no sync task: {e}")),
-        }
-    }
-
-    pub fn stop(&mut self) {
-        if let Some(id) = self.task.take() {
-            sicompass_pdk::tasks::cancel(id);
-        }
-    }
-
-    /// A response the task passed on, merged into the cache. Answers the
-    /// `next_batch` to save when it changed anything.
-    pub fn on_task_event(&mut self, id: u64, event: sicompass_pdk::TaskEvent) -> Option<String> {
-        if self.task != Some(id) {
-            return None;
-        }
-        match event {
-            sicompass_pdk::TaskEvent::Progress(bytes) => {
-                let body: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-                let next_batch = body
-                    .get("next_batch")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_owned();
-                if parse_sync_response(body, &mut lock(&self.cache)) {
-                    self.notify.store(true, Ordering::Relaxed);
-                    return (!next_batch.is_empty()).then_some(next_batch);
-                }
-                None
-            }
-            sicompass_pdk::TaskEvent::Done(result) => {
-                if let Err(e) = result {
-                    sicompass_pdk::host::log(&format!("chatclient: sync ended: {e}"));
-                }
-                self.task = None;
-                None
-            }
-        }
-    }
-}
-
-/// The sync task itself, in the worker instance: long-poll until cancelled,
-/// passing each response on, and wait out a failure before trying again.
-#[cfg(target_arch = "wasm32")]
-pub fn run_sync_task(input: &[u8]) -> Result<Vec<u8>, String> {
-    use sicompass_pdk::tasks::{cancelled, emit};
-    let job: serde_json::Value = serde_json::from_slice(input).map_err(|e| e.to_string())?;
-    let field = |k: &str| job.get(k).and_then(|v| v.as_str()).unwrap_or("").to_owned();
-    let (homeserver, token, mut since) = (field("homeserver"), field("token"), field("since"));
-    let base = homeserver.trim_end_matches('/').to_owned();
-    let client = crate::http::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| e.to_string())?;
-    while !cancelled() {
-        let url = if since.is_empty() {
-            format!("{base}/_matrix/client/v3/sync?timeout=0")
-        } else {
-            format!("{base}/_matrix/client/v3/sync?since={since}&timeout=30000")
-        };
-        let answer = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .ok()
-            .filter(|r| r.status().is_success())
-            .and_then(|r| r.text().ok());
-        match answer {
-            Some(body) => {
-                if let Some(nb) = serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|v| v.get("next_batch")?.as_str().map(str::to_owned))
-                {
-                    since = nb;
-                }
-                emit(body.as_bytes());
-            }
-            None => {
-                for _ in 0..RECONNECT_DELAY_SECS {
-                    if cancelled() {
-                        return Ok(Vec::new());
-                    }
-                    std::thread::sleep(Duration::from_secs(1));
-                }
-            }
-        }
-    }
-    Ok(Vec::new())
-}
-
 // ---------------------------------------------------------------------------
 // Sync loop
 // ---------------------------------------------------------------------------
 
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)] // the thread's whole state, passed once
 fn sync_loop(
     homeserver: String,
@@ -784,7 +645,6 @@ fn sync_loop(
 
 /// Build the HTTP client once, then loop over /sync calls until an error or
 /// the running flag is cleared.
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)] // the thread's whole state, passed once
 fn run_sync_session(
     homeserver: &str,
@@ -854,7 +714,6 @@ fn run_sync_session(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 /// Write `next_batch` into settings.json under `"chat client"."chatSyncNextBatch"`.
 ///
 /// `file_lock` must be the same mutex used by `save_setting` on the main thread
@@ -1390,5 +1249,71 @@ mod tests {
                 .invite_display_to_id
                 .contains_key("[invite] !nameless:server")
         );
+    }
+
+    /// The thread long-polls the homeserver, merges what it hears into the
+    /// cache, raises the refresh flag for `poll`, and saves the sync position
+    /// in the plugin's state file, next to what is already there.
+    #[test]
+    fn the_sync_thread_merges_a_response_and_saves_the_position() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let server = rt.block_on(MockServer::start());
+        rt.block_on(
+            Mock::given(method("GET"))
+                .and(path("/_matrix/client/v3/sync"))
+                .and(header("Authorization", "Bearer tok"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(make_sync_response(
+                    "s7",
+                    "!r:s",
+                    Some("General"),
+                    &[("$e1", "@a:s", "hello")],
+                )))
+                .mount(&server),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("chat.json");
+        std::fs::write(&state, r#"{"chat client":{"chatUserId":"@me:s"}}"#).unwrap();
+
+        let cache = Arc::new(Mutex::new(SyncCache::default()));
+        let notify = Arc::new(AtomicBool::new(false));
+        let mut ctrl = SyncController::new(Arc::clone(&cache), Arc::clone(&notify));
+        ctrl.start(
+            server.uri(),
+            "tok".to_owned(),
+            Some(state.clone()),
+            "@me:s".to_owned(),
+            Arc::new(Mutex::new(())),
+        );
+
+        // The flag goes up before the position is written, so wait for both.
+        let saved = || -> serde_json::Value {
+            std::fs::read_to_string(&state)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !(notify.load(Ordering::Relaxed)
+            && saved()["chat client"]["chatSyncNextBatch"] == "s7")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        ctrl.stop();
+
+        assert!(notify.load(Ordering::Relaxed), "a refresh is asked for");
+        {
+            let cache = lock(&cache);
+            assert_eq!(cache.next_batch, "s7");
+            assert_eq!(cache.self_user_id, "@me:s");
+            assert_eq!(cache.rooms["!r:s"].timeline[0].body, "hello");
+        }
+        let saved = saved();
+        assert_eq!(saved["chat client"]["chatSyncNextBatch"], "s7");
+        assert_eq!(saved["chat client"]["chatUserId"], "@me:s", "kept");
     }
 }

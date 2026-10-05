@@ -18,17 +18,11 @@ pub fn make_dirs(dir: &Path) {
     let _ = std::fs::create_dir_all(dir);
 }
 
-/// Open `url` in the user's browser: through the host inside the sandbox.
-/// Natively (the unit tests) nothing is opened.
+/// Open `url` in the user's browser, through the app.
 // Only reached outside the tests (registration's browser fallback).
 #[cfg_attr(test, allow(dead_code))]
 pub fn open_url(url: &str) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = sicompass_pdk::desktop::open_url(url);
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = url;
+    if let Err(e) = sicompass_sdk::plugin::desktop::open_url(url) {
+        eprintln!("chatclient: cannot open {url}: {e}");
     }
 }

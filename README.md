@@ -15,9 +15,8 @@ in Settings, under chat client (matrix.org by default). New messages arrive in
 the background.
 
 The chat client asks to reach any server on the internet, because your
-homeserver is yours to choose. It never reaches your own computer or local
-network. The Store shows that before you install it, and installing it is your
-approval.
+homeserver is yours to choose. The Store shows that before you install it, and
+installing it is your approval.
 
 ## Install
 
@@ -28,21 +27,26 @@ keeps it up to date.
 ## Building from source
 
 ```bash
-nix develop          # the toolchain, with the wasm32-wasip2 target
-cargo test           # natively, against a mock homeserver
-cargo build --release --target wasm32-wasip2
-cp target/wasm32-wasip2/release/chatclient_plugin.wasm plugin.wasm
+nix develop          # the toolchain
+cargo test           # against a mock homeserver
+cargo build --release
+cp target/release/chatclient-plugin plugin
 ```
 
-`./scripts/release-plugin.sh --dry-run` does the build, checks the component
-against `plugin.json`, and signs and verifies it with a throwaway key, the way
-a release is made.
+To install a build of your own, copy `plugin.json`, the built `plugin` program
+(`plugin.exe` on Windows) and `locales/` into a folder named `chatclient` in
+the Sicompass plugins folder (`~/.config/sicompass/plugins/` on Linux,
+`~/Library/Application Support/sicompass/plugins/` on macOS) and restart
+Sicompass.
+
+`./scripts/release-plugin.sh --dry-run` builds this computer's release, packs
+it, and signs and verifies it with a throwaway key, the way a release is made.
 
 ## Related repositories
 
 - [sicompass](https://github.com/friendlyflow/sicompass), the application
 - [sicompass-plugin-sdk](https://github.com/friendlyflow/sicompass-plugin-sdk),
-  the SDK, the WASM plugin kit and the cloud backup library
+  the SDK, the plugin kit and the cloud backup library
 
 ## Community
 

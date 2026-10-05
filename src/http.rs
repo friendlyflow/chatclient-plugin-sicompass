@@ -1,9 +1,8 @@
 //! The HTTP the chat client speaks, in the shape of `reqwest::blocking`.
 //!
-//! Inside the sandbox every request goes through the host's `net.fetch`, which
-//! checks it against `allowedHosts` (any public server, for a homeserver the
-//! user chooses) and never reaches the local network. Natively, for the unit
-//! tests against a mock homeserver, it is reqwest.
+//! A blocking `ureq` client with rustls and bundled roots. The homeserver is the
+//! user's choice, so any server is reachable (`plugin.json` declares
+//! `allowedHosts: ["*"]`). The unit tests point it at a mock homeserver.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -37,27 +36,39 @@ impl std::fmt::Display for StatusCode {
     }
 }
 
+/// The most a response may hold. An initial `/sync` of a busy account is the
+/// largest thing the homeserver sends.
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Builds a [`Client`].
 pub struct ClientBuilder {
     timeout: Duration,
+    user_agent: Option<String>,
 }
 
 impl ClientBuilder {
-    /// The whole-request timeout (natively; inside the sandbox the host sets
-    /// it: longer in a task, for the long poll).
+    /// The whole-request timeout, start to end.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// Kept for the call sites; the host sets its own user agent.
-    pub fn user_agent(self, _agent: &str) -> Self {
+    pub fn user_agent(mut self, agent: &str) -> Self {
+        self.user_agent = Some(agent.to_owned());
         self
     }
 
     pub fn build(self) -> Result<Client, Error> {
+        let mut config = ureq::Agent::config_builder()
+            // Every status comes back as it is: the callers read Matrix's
+            // error bodies themselves.
+            .http_status_as_error(false)
+            .timeout_global(Some(self.timeout));
+        if let Some(agent) = self.user_agent {
+            config = config.user_agent(agent);
+        }
         Ok(Client {
-            timeout: self.timeout,
+            agent: config.build().into(),
         })
     }
 }
@@ -65,23 +76,24 @@ impl ClientBuilder {
 /// Makes requests.
 #[derive(Clone)]
 pub struct Client {
-    timeout: Duration,
+    agent: ureq::Agent,
 }
 
 impl Client {
     pub fn builder() -> ClientBuilder {
         ClientBuilder {
             timeout: Duration::from_secs(30),
+            user_agent: None,
         }
     }
 
     fn request(&self, method: &str, url: &str) -> RequestBuilder {
         RequestBuilder {
+            agent: self.agent.clone(),
             method: method.to_owned(),
             url: url.to_owned(),
             headers: Vec::new(),
             body: None,
-            timeout: self.timeout,
         }
     }
 
@@ -100,11 +112,11 @@ impl Client {
 
 /// One request, being built.
 pub struct RequestBuilder {
+    agent: ureq::Agent,
     method: String,
     url: String,
     headers: Vec<(String, String)>,
     body: Option<Vec<u8>>,
-    timeout: Duration,
 }
 
 impl RequestBuilder {
@@ -121,41 +133,29 @@ impl RequestBuilder {
         self
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub fn send(self) -> Result<Response, Error> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(self.timeout)
-            .build()
-            .map_err(|e| Error(e.to_string()))?;
-        let method = reqwest::Method::from_bytes(self.method.as_bytes())
-            .map_err(|e| Error(e.to_string()))?;
-        let mut req = client.request(method, &self.url);
+        let fail = |e: &dyn std::fmt::Display| Error(format!("{}: {e}", self.url));
+        let mut builder = ureq::http::Request::builder()
+            .method(self.method.as_str())
+            .uri(&self.url);
         for (k, v) in &self.headers {
-            req = req.header(k, v);
+            builder = builder.header(k, v);
         }
-        if let Some(body) = self.body {
-            req = req.body(body);
-        }
-        let resp = req.send().map_err(|e| Error(e.to_string()))?;
+        let result = match &self.body {
+            Some(body) => self
+                .agent
+                .run(builder.body(body.as_slice()).map_err(|e| fail(&e))?),
+            None => self.agent.run(builder.body(()).map_err(|e| fail(&e))?),
+        };
+        let mut resp = result.map_err(|e| fail(&e))?;
         let status = StatusCode(resp.status().as_u16());
-        let body = resp.bytes().map_err(|e| Error(e.to_string()))?.to_vec();
+        let body = resp
+            .body_mut()
+            .with_config()
+            .limit(MAX_RESPONSE_BYTES)
+            .read_to_vec()
+            .map_err(|e| fail(&e))?;
         Ok(Response { status, body })
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    pub fn send(self) -> Result<Response, Error> {
-        let _ = self.timeout;
-        let resp = sicompass_pdk::net::fetch(&sicompass_pdk::net::HttpRequest {
-            method: self.method,
-            url: self.url,
-            headers: self.headers,
-            body: self.body,
-        })
-        .map_err(Error)?;
-        Ok(Response {
-            status: StatusCode(resp.status),
-            body: resp.body,
-        })
     }
 }
 
@@ -172,11 +172,5 @@ impl Response {
 
     pub fn json<T: DeserializeOwned>(self) -> Result<T, Error> {
         serde_json::from_slice(&self.body).map_err(|e| Error(e.to_string()))
-    }
-
-    /// The body as text (the sync task passes it on whole).
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    pub fn text(self) -> Result<String, Error> {
-        Ok(String::from_utf8_lossy(&self.body).into_owned())
     }
 }

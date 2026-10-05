@@ -1,7 +1,9 @@
 //! Matrix chat client provider — Rust port of `lib_chatclient/`.
 //!
-//! Communicates with a Matrix homeserver via the Client-Server API.
-//! Uses `reqwest` blocking for HTTP (no async runtime required).
+//! A sicompass plugin: a program sicompass starts (`src/main.rs`), with the
+//! user's rights. It talks to a Matrix homeserver over the Client-Server API,
+//! with a blocking HTTP client ([`http`], no async runtime), and long-polls
+//! `/sync` on a thread of its own ([`sync`]).
 //!
 //! ## FFON tree layout
 //!
@@ -45,7 +47,7 @@ mod messages;
 mod rooms;
 mod sync;
 
-use sicompass_pdk::{Descriptor, FfonElement, Plugin, PollResult, ProviderOp, export_plugin};
+use sicompass_sdk::plugin::{Descriptor, FfonElement, Plugin, PollResult, ProviderOp};
 use sicompass_sdk::timeline::ChatOpKind;
 
 use std::collections::HashMap;
@@ -57,6 +59,10 @@ use std::sync::{Arc, Mutex};
 // ---------------------------------------------------------------------------
 
 static TXN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// How long a request made on a call from the app may take, start to end:
+/// below the app's 10-second deadline for a call.
+const UI_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 // ---------------------------------------------------------------------------
 // Auth result (mirrors C's ChatAuthResult)
@@ -293,10 +299,13 @@ impl ChatClientProvider {
         self.save_setting("chatUserId", user_id);
     }
 
+    /// The client for requests made on a call from the app. The app gives up
+    /// on a call after 10 seconds and ends the plugin, so a homeserver that is
+    /// slower than this is an error the user sees instead.
     fn client(&self) -> Result<http::Client, String> {
         http::Client::builder()
             .user_agent("sicompass/1.0")
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(UI_REQUEST_TIMEOUT)
             .build()
             .map_err(|e| e.to_string())
     }
@@ -1462,7 +1471,7 @@ impl Plugin for ChatClientProvider {
         }
     }
 
-    /// The sync task's new messages ask for a refresh; errors are reported.
+    /// The sync thread's new messages ask for a refresh; errors are reported.
     fn poll(&mut self) -> PollResult {
         let p = self.current_path.as_str();
         PollResult {
@@ -1470,24 +1479,6 @@ impl Plugin for ChatClientProvider {
             at_root: p.is_empty() || p == "/",
             error: self.take_error(),
             ..Default::default()
-        }
-    }
-
-    fn run_task(&mut self, name: &str, input: &[u8]) -> Result<Vec<u8>, String> {
-        match name {
-            #[cfg(target_arch = "wasm32")]
-            sync::SYNC_TASK => sync::run_sync_task(input),
-            other => {
-                let _ = input;
-                Err(format!("chatclient has no task named `{other}`"))
-            }
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn on_task_event(&mut self, id: u64, event: sicompass_pdk::TaskEvent) {
-        if let Some(next_batch) = self.sync_controller.on_task_event(id, event) {
-            self.save_setting("chatSyncNextBatch", &next_batch);
         }
     }
 
@@ -1524,9 +1515,8 @@ impl Plugin for ChatClientProvider {
 
     fn init(&mut self) {
         use serde_json::Value;
-        // The settings `plugin.json` declares, from the host. What an earlier
+        // The settings `plugin.json` declares, from the app. What an earlier
         // sign-in saved in the plugin's own file (below) takes over from them.
-        #[cfg(target_arch = "wasm32")]
         for key in [
             "chatHomeserver",
             "chatAccessToken",
@@ -1534,7 +1524,7 @@ impl Plugin for ChatClientProvider {
             "chatPassword",
             "chatEmail",
         ] {
-            if let Some(v) = sicompass_pdk::host::get_setting(key)
+            if let Some(v) = sicompass_sdk::plugin::host::get_setting(key)
                 && !v.is_empty()
             {
                 self.on_setting_change(key, &v);
@@ -1762,13 +1752,10 @@ impl Plugin for ChatClientProvider {
 
 /// Where the sign-in and the sync position are kept: the plugin's storage
 /// folder (`permissions.storage`), in the shape of a settings file with one
-/// `chat client` section. Natively (the tests) nowhere unless a test names one.
+/// `chat client` section. Outside sicompass (the tests) there is no storage
+/// folder, so nowhere unless a test names one.
 fn default_state_path() -> Option<std::path::PathBuf> {
-    if cfg!(target_arch = "wasm32") {
-        Some(std::path::PathBuf::from(sicompass_pdk::STORAGE_DIR).join("chat.json"))
-    } else {
-        None
-    }
+    sicompass_sdk::plugin::storage_dir().map(|dir| dir.join("chat.json"))
 }
 
 /// A recorded action as the provider op the app keeps on its timeline: the
@@ -1808,14 +1795,14 @@ fn encode_op(op: &ChatOpKind) -> ProviderOp {
     }
     ProviderOp {
         command: command.to_owned(),
-        payload: sicompass_pdk::encode_one(&payload),
+        payload: sicompass_sdk::plugin::encode_one(&payload),
         label: command.replace('-', " "),
     }
 }
 
 /// The inverse of [`encode_op`]; `None` for an entry that is not one.
 fn decode_op(entry: &ProviderOp) -> Option<ChatOpKind> {
-    let payload = sicompass_pdk::decode_one(&entry.payload)?;
+    let payload = sicompass_sdk::plugin::decode_one(&entry.payload)?;
     let parts: Vec<String> = payload
         .as_obj()?
         .children
@@ -1846,8 +1833,6 @@ fn decode_op(entry: &ProviderOp) -> Option<ChatOpKind> {
         _ => return None,
     })
 }
-
-export_plugin!(ChatClientProvider);
 
 // ---------------------------------------------------------------------------
 // Helpers
