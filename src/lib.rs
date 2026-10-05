@@ -60,9 +60,9 @@ use std::sync::{Arc, Mutex};
 
 static TXN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// How long a request made on a call from the app may take, start to end:
-/// below the app's 10-second deadline for a call.
-const UI_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// How long a request made on a call from the app may take, start to end. The
+/// app waits for the call, so a homeserver that hangs becomes an error.
+const UI_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Auth result (mirrors C's ChatAuthResult)
@@ -299,9 +299,9 @@ impl ChatClientProvider {
         self.save_setting("chatUserId", user_id);
     }
 
-    /// The client for requests made on a call from the app. The app gives up
-    /// on a call after 10 seconds and ends the plugin, so a homeserver that is
-    /// slower than this is an error the user sees instead.
+    /// The client for requests made on a call from the app, which waits for
+    /// them: a homeserver slower than [`UI_REQUEST_TIMEOUT`] is an error the
+    /// user sees instead.
     fn client(&self) -> Result<http::Client, String> {
         http::Client::builder()
             .user_agent("sicompass/1.0")

@@ -31,10 +31,10 @@ GitHub releases, one build per platform. The plugin platform is described in
   `reqwest::blocking` over `ureq` (rustls with ring and bundled roots, so the
   static musl build needs no system TLS library). The tests run it against a
   wiremock homeserver. Never against a real one.
-- **Every call from the app has a 10-second deadline**, after which the app
-  ends the plugin. Requests made on a call (sign-in, sending, loading earlier
-  messages) time out after 8 seconds (`UI_REQUEST_TIMEOUT`), so a slow
-  homeserver is an error the user sees.
+- **The app waits for every call to answer**, drawing nothing meanwhile.
+  Requests made on a call (sign-in, sending, loading earlier messages) time
+  out after 30 seconds (`UI_REQUEST_TIMEOUT`), so a homeserver that hangs is
+  an error the user sees.
 - **`/sync`** long-polls on a thread of its own (`sync::SyncController`). It
   merges each response into the shared cache, saves the sync position, and
   raises the flag that `poll` turns into `needs_refresh`. After a failure it

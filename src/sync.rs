@@ -1,8 +1,7 @@
 //! Matrix /sync in the background.
 //!
-//! The long poll runs on a thread of its own ([`SyncController`]), because a
-//! call from the app must answer within its 10-second deadline and a `/sync`
-//! waits up to 30 seconds. The thread merges each response into the shared
+//! The long poll runs on a thread of its own ([`SyncController`]), because the
+//! app waits for every call to answer, and a `/sync` waits up to 30 seconds. The thread merges each response into the shared
 //! cache, saves the sync position to the plugin's state file (under the same
 //! lock as the rest of the plugin's writes to it), and raises a flag that
 //! `poll` turns into a refresh. After a failure it waits before reconnecting.
