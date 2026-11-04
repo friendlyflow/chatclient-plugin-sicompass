@@ -27,6 +27,14 @@
 //!   room-name      (obj)  — child room
 //! ```
 //!
+//! ## Text from outside
+//!
+//! `plugin.json` asks for markup, so a row's HTML-named tags are live, and almost
+//! everything in a row was written by a stranger: a sender, a message, a room's
+//! name and topic. Every such value goes through [`tags::escape`] where the row is
+//! built. Everything kept (the sync cache, drafts, the path) is plain text, and
+//! only a row is escaped. See [`escape`] for the way back.
+//!
 //! ## Configuration
 //!
 //! The settings `plugin.json` declares, read at `init` and on change:
@@ -39,6 +47,7 @@
 //! is intentionally never written anywhere.
 
 mod auth;
+mod escape;
 mod files;
 mod http;
 mod localize;
@@ -48,6 +57,7 @@ mod rooms;
 mod sync;
 
 use sicompass_sdk::plugin::{Descriptor, FfonElement, Plugin, PollResult, ProviderOp};
+use sicompass_sdk::tags;
 use sicompass_sdk::timeline::ChatOpKind;
 
 use std::collections::HashMap;
@@ -373,12 +383,16 @@ impl ChatClientProvider {
         let mut invites: Vec<&sync::InviteState> = cache.invites.values().collect();
         invites.sort_by(|a, b| a.display_name.cmp(&b.display_name));
         for inv in invites {
-            let mut item = FfonElement::new_obj(format!("[invite] {}", inv.display_name));
+            let mut item =
+                FfonElement::new_obj(tags::escape(&format!("[invite] {}", inv.display_name)));
             if !inv.inviter.is_empty() {
                 item.as_obj_mut()
                     .unwrap()
                     .children
-                    .push(FfonElement::new_str(format!("from {}", inv.inviter)));
+                    .push(FfonElement::new_str(tags::escape(&format!(
+                        "from {}",
+                        inv.inviter
+                    ))));
             }
             items.push(item);
         }
@@ -391,10 +405,10 @@ impl ChatClientProvider {
             .collect();
         spaces.sort_by(|a, b| a.display_name.cmp(&b.display_name));
         for space in spaces {
-            items.push(FfonElement::new_obj(format!(
+            items.push(FfonElement::new_obj(tags::escape(&format!(
                 "[space] {}",
                 space.display_name
-            )));
+            ))));
         }
 
         // DM rooms.
@@ -452,10 +466,13 @@ impl ChatClientProvider {
         let read_count = n.saturating_sub(unread);
         items.extend(room.timeline.iter().enumerate().map(|(i, ev)| {
             let marker = if i < read_count { "[read]" } else { "[unread]" };
-            FfonElement::new_str(format!("{marker} {}: {}", ev.sender, ev.body))
+            FfonElement::new_str(tags::escape(&format!(
+                "{marker} {}: {}",
+                ev.sender, ev.body
+            )))
         }));
         let input = match draft {
-            Some(d) if !d.is_empty() => format!("<input>{d}</input>"),
+            Some(d) if !d.is_empty() => tags::format_input(&tags::escape(&d)),
             _ => "<input></input>".to_owned(),
         };
         items.push(FfonElement::new_str(input));
@@ -482,7 +499,7 @@ impl ChatClientProvider {
                     .get(child_id)
                     .map(|r| r.display_name.clone())
                     .unwrap_or_else(|| child_id.clone());
-                FfonElement::new_obj(label)
+                FfonElement::new_obj(tags::escape(&label))
             })
             .collect()
     }
@@ -519,7 +536,7 @@ impl ChatClientProvider {
                     .as_deref()
                     .map(|n| format!("{} ({})", m.user_id, n))
                     .unwrap_or_else(|| m.user_id.clone());
-                FfonElement::new_obj(label)
+                FfonElement::new_obj(tags::escape(&label))
             })
             .collect()
     }
@@ -530,7 +547,7 @@ impl ChatClientProvider {
         }
         self.public_rooms_cache
             .iter()
-            .map(|(display, _)| FfonElement::new_obj(display.clone()))
+            .map(|(display, _)| FfonElement::new_obj(tags::escape(display)))
             .collect()
     }
 
@@ -541,7 +558,7 @@ impl ChatClientProvider {
             .find(|(d, _)| d == display_key)
         {
             Some((_, room_id)) => vec![
-                FfonElement::new_str(format!("room id: {room_id}")),
+                FfonElement::new_str(tags::escape(&format!("room id: {room_id}"))),
                 FfonElement::new_str("<button>join-public-room</button>Join this room".to_owned()),
             ],
             None => vec![FfonElement::new_str("room not found".to_owned())],
@@ -558,22 +575,23 @@ impl ChatClientProvider {
         };
         let mut items = Vec::new();
         if let Some(err) = &self.register_error {
-            items.push(FfonElement::new_str(format!("Error: {err}")));
+            items.push(FfonElement::new_str(tags::escape(&format!("Error: {err}"))));
         }
         items.push(FfonElement::new_str(format!(
-            "Homeserver: <input>{homeserver}</input>"
+            "Homeserver: <input>{}</input>",
+            tags::escape(homeserver)
         )));
         items.push(FfonElement::new_str(format!(
             "Username: <input>{}</input>",
-            self.username
+            tags::escape(&self.username)
         )));
         items.push(FfonElement::new_str(format!(
             "Email: <input>{}</input>",
-            self.email
+            tags::escape(&self.email)
         )));
         items.push(FfonElement::new_str(format!(
             "Password: <input>{}</input>",
-            self.password
+            tags::escape(&self.password)
         )));
         items.push(FfonElement::new_str(
             "<button>register</button>Register account".to_owned(),
@@ -598,18 +616,19 @@ impl ChatClientProvider {
         };
         let mut items = Vec::new();
         if let Some(err) = &self.last_error {
-            items.push(FfonElement::new_str(format!("Error: {err}")));
+            items.push(FfonElement::new_str(tags::escape(&format!("Error: {err}"))));
         }
         items.push(FfonElement::new_str(format!(
-            "Homeserver: <input>{homeserver}</input>"
+            "Homeserver: <input>{}</input>",
+            tags::escape(homeserver)
         )));
         items.push(FfonElement::new_str(format!(
             "Username: <input>{}</input>",
-            self.username
+            tags::escape(&self.username)
         )));
         items.push(FfonElement::new_str(format!(
             "Password: <input>{}</input>",
-            self.password
+            tags::escape(&self.password)
         )));
         items.push(FfonElement::new_str(
             "<button>login</button>Sign in".to_owned(),
@@ -853,6 +872,10 @@ impl ChatClientProvider {
         _elem_type: i32,
         error: &mut String,
     ) -> Option<FfonElement> {
+        // The app passes the row as it was written, escapes and all. Everything
+        // this is compared with (the cache's keys, a member's id) is plain.
+        let elem_key = tags::strip_display(elem_key);
+        let elem_key = elem_key.as_str();
         match cmd {
             "send message" => Some(FfonElement::new_str("<input></input>".to_owned())),
 
@@ -878,10 +901,10 @@ impl ChatClientProvider {
                     self.save_access_token(&result.access_token);
                     self.save_user_id(&result.user_id);
                     self.maybe_start_sync();
-                    Some(FfonElement::new_str(format!(
+                    Some(FfonElement::new_str(tags::escape(&format!(
                         "logged in as {}",
                         result.user_id
-                    )))
+                    ))))
                 } else {
                     let mut args = localize::Args::new();
                     args.set("err", result.error.clone());
@@ -911,10 +934,10 @@ impl ChatClientProvider {
                     self.save_user_id(&result.user_id);
                     self.uia_session.clear();
                     self.maybe_start_sync();
-                    Some(FfonElement::new_str(format!(
+                    Some(FfonElement::new_str(tags::escape(&format!(
                         "registered as {}",
                         result.user_id
-                    )))
+                    ))))
                 } else if result.requires_auth && !result.session.is_empty() {
                     self.uia_session = result.session.clone();
                     self.register_mode = true;
@@ -928,10 +951,10 @@ impl ChatClientProvider {
                         );
                         files::open_url(&fallback_url);
                     }
-                    Some(FfonElement::new_str(format!(
+                    Some(FfonElement::new_str(tags::escape(&format!(
                         "complete {} in browser, then run complete registration",
                         result.next_stage,
-                    )))
+                    ))))
                 } else {
                     let mut args = localize::Args::new();
                     args.set("err", result.error.clone());
@@ -954,10 +977,10 @@ impl ChatClientProvider {
                     self.save_user_id(&result.user_id);
                     self.uia_session.clear();
                     self.maybe_start_sync();
-                    Some(FfonElement::new_str(format!(
+                    Some(FfonElement::new_str(tags::escape(&format!(
                         "registered as {}",
                         result.user_id
-                    )))
+                    ))))
                 } else if result.requires_auth && !result.session.is_empty() {
                     self.uia_session = result.session.clone();
                     #[cfg(not(test))]
@@ -970,10 +993,10 @@ impl ChatClientProvider {
                         );
                         files::open_url(&fallback_url);
                     }
-                    Some(FfonElement::new_str(format!(
+                    Some(FfonElement::new_str(tags::escape(&format!(
                         "complete {} in browser, then run complete registration",
                         result.next_stage,
-                    )))
+                    ))))
                 } else {
                     self.uia_session.clear();
                     let mut args = localize::Args::new();
@@ -1061,7 +1084,7 @@ impl ChatClientProvider {
                 });
                 drop(cache);
                 match room_info {
-                    Some(info) => Some(FfonElement::new_str(info)),
+                    Some(info) => Some(FfonElement::new_str(tags::escape(&info))),
                     None => {
                         *error = localize::t("chatclient-error-room-not-found");
                         None
@@ -1249,7 +1272,9 @@ impl ChatClientProvider {
                     Some(id) => match self.do_join(&id) {
                         Ok(_) => {
                             self.current_path = "/".to_owned();
-                            Some(FfonElement::new_str(format!("joined {elem_key}")))
+                            Some(FfonElement::new_str(tags::escape(&format!(
+                                "joined {elem_key}"
+                            ))))
                         }
                         Err(e) => {
                             let mut args = localize::Args::new();
@@ -1269,7 +1294,9 @@ impl ChatClientProvider {
                 };
                 // Navigate into [members] sub-view.
                 self.push_path("[members]");
-                Some(FfonElement::new_str(format!("members of {room_key}")))
+                Some(FfonElement::new_str(tags::escape(&format!(
+                    "members of {room_key}"
+                ))))
             }
 
             "kick member" => {
@@ -1347,7 +1374,9 @@ impl ChatClientProvider {
                 };
                 // unban has no reason, execute immediately
                 match self.do_unban_member(&room_id, &member_id) {
-                    Ok(()) => Some(FfonElement::new_str(format!("unbanned {member_id}"))),
+                    Ok(()) => Some(FfonElement::new_str(tags::escape(&format!(
+                        "unbanned {member_id}"
+                    )))),
                     Err(e) => {
                         let mut args = localize::Args::new();
                         args.set("err", e.to_string());
@@ -1636,7 +1665,9 @@ impl Plugin for ChatClientProvider {
         self.current_path = path.to_owned();
     }
 
-    fn commit_edit(&mut self, _old: &str, new_content: &str) -> bool {
+    fn commit_edit(&mut self, old: &str, new_content: &str) -> bool {
+        let new_content = escape::typed_value(old, new_content);
+        let new_content = new_content.as_str();
         // Pending action (from a command that requested text input) takes priority.
         if let Some(action) = self.pending_action.take() {
             let mut err = String::new();
@@ -1844,6 +1875,7 @@ fn decode_op(entry: &ProviderOp) -> Option<ChatOpKind> {
 /// expanded in-place by the renderer (showing children) rather than triggering a
 /// provider fetch — which would prevent navigating into the room.
 fn room_list_item(key: String, unread: u32, highlight: u32) -> FfonElement {
+    let key = tags::escape(&key);
     let label = if highlight > 0 {
         format!("{key} [mention:{highlight}]")
     } else if unread > 0 {
@@ -3726,6 +3758,490 @@ mod tests {
                 .any(|e| e.as_obj().is_some_and(|o| o.key == "General")),
             "badge must be gone after mark read; got: {list_after:?}"
         );
+    }
+
+    // ---- Text from outside stays text --------------------------------------
+
+    /// What a stranger can put in a name or a message. A backslash at the end must
+    /// not eat what follows it.
+    const HOSTILE: [&str; 14] = [
+        "<b>x</b>",
+        r#"<img src="/etc/passwd">"#,
+        r#"<a href="https://evil.example">y</a>"#,
+        "<style>li { color: red }</style>",
+        "<input>y</input>",
+        "<button>send</button>",
+        "<button>send</button>Send",
+        "<link>https://evil.example</link>",
+        "<image>/etc/passwd</image>",
+        "<id>1</id>z",
+        "<many-opt></many-opt>k",
+        "<src=1>z",
+        r"text ending in a backslash\",
+        r"\<b>an escape of its own\>",
+    ];
+
+    /// The row makes nothing live and reads as `shown`, by every route the app has.
+    fn assert_literal(row: &str, shown: &str) {
+        use sicompass_sdk::markup;
+        assert!(!markup::has_markup(row), "markup in {row:?}");
+        assert!(markup::targets(row).is_empty(), "a target in {row:?}");
+        assert!(markup::style_sheet(row).is_none(), "a stylesheet: {row:?}");
+        assert!(!tags::has_input(row), "an input in {row:?}");
+        assert!(!tags::has_button(row), "a button in {row:?}");
+        assert!(!tags::has_link(row), "a link in {row:?}");
+        assert!(!tags::has_image(row), "an image in {row:?}");
+        assert!(!tags::has_id(row), "an id in {row:?}");
+        assert_eq!(tags::strip_display(row), shown);
+        assert_eq!(tags::strip_display(&markup::plain(row)), shown);
+    }
+
+    fn key_of(e: &FfonElement) -> &str {
+        match e {
+            FfonElement::Str(s) => s,
+            FfonElement::Obj(o) => &o.key,
+        }
+    }
+
+    fn row_showing<'a>(items: &'a [FfonElement], shown: &str) -> &'a str {
+        items
+            .iter()
+            .map(key_of)
+            .find(|row| tags::strip_display(row) == shown)
+            .unwrap_or_else(|| panic!("no row showing {shown:?} in {items:?}"))
+    }
+
+    #[test]
+    fn a_message_and_its_sender_are_shown_literally() {
+        for text in HOSTILE {
+            let mut p = ChatClientProvider::new().with_sync_disabled();
+            p.access_token = "t".to_owned();
+            seed_room_with_events(&mut p, "!r:s", "Room", &[("$1", text, text)]);
+            p.push_path("Room");
+            let items = p.fetch();
+            let shown = format!("[read] {text}: {text}");
+            assert_literal(row_showing(&items, &shown), &shown);
+        }
+    }
+
+    #[test]
+    fn a_room_list_shows_every_name_literally() {
+        for name in HOSTILE {
+            let mut p = ChatClientProvider::new().with_sync_disabled();
+            p.access_token = "t".to_owned();
+            seed_room(&mut p, "!plain:s", name);
+            {
+                let mut cache = p.sync_cache.lock().unwrap();
+                cache.next_batch = "b".to_owned();
+                cache.rooms.insert(
+                    "!sp:s".to_owned(),
+                    sync::RoomState {
+                        room_id: "!sp:s".to_owned(),
+                        display_name: name.to_owned(),
+                        kind: sync::RoomKind::Space,
+                        ..Default::default()
+                    },
+                );
+                cache.rooms.insert(
+                    "!dm:s".to_owned(),
+                    sync::RoomState {
+                        room_id: "!dm:s".to_owned(),
+                        display_name: "dm".to_owned(),
+                        is_dm: true,
+                        ..Default::default()
+                    },
+                );
+                cache
+                    .direct_room_to_user
+                    .insert("!dm:s".to_owned(), name.to_owned());
+                cache.invites.insert(
+                    "!inv:s".to_owned(),
+                    sync::InviteState {
+                        display_name: name.to_owned(),
+                        inviter: name.to_owned(),
+                    },
+                );
+            }
+            p.test_set_unread(name, 2, 0);
+            let items = p.fetch();
+            for shown in [
+                format!("{name} [unread:2]"),
+                format!("[space] {name}"),
+                format!("[dm] {name}"),
+                format!("[invite] {name}"),
+            ] {
+                assert_literal(row_showing(&items, &shown), &shown);
+            }
+            let invite = items
+                .iter()
+                .find_map(|e| e.as_obj().filter(|o| o.key.starts_with("[invite] ")))
+                .expect("the invite");
+            let from = format!("from {name}");
+            assert_literal(row_showing(&invite.children, &from), &from);
+        }
+    }
+
+    #[test]
+    fn a_room_with_brackets_in_its_name_can_be_entered() {
+        let name = "<b>x";
+        let mut p = ChatClientProvider::new().with_sync_disabled();
+        p.access_token = "t".to_owned();
+        seed_room_with_events(&mut p, "!r:s", name, &[("$1", "@a:s", "hello")]);
+        p.test_set_unread(name, 1, 0);
+        let items = p.fetch();
+        let row = key_of(&items[0]).to_owned();
+        assert_eq!(row, r"\<b\>x [unread:1]");
+        p.push_path(&tags::strip_display(&row));
+        let inside = p.fetch();
+        row_showing(&inside, "[unread] @a:s: hello");
+    }
+
+    #[test]
+    fn a_space_shows_its_children_literally() {
+        for name in HOSTILE {
+            let mut p = ChatClientProvider::new().with_sync_disabled();
+            p.access_token = "t".to_owned();
+            seed_room(&mut p, "!child:s", name);
+            seed_room(&mut p, "!sp:s", "[space] S");
+            {
+                let mut cache = p.sync_cache.lock().unwrap();
+                let space = cache.rooms.get_mut("!sp:s").unwrap();
+                space.space_children = vec!["!child:s".to_owned(), name.to_owned()];
+            }
+            p.push_path("[space] S");
+            let items = p.fetch();
+            assert_eq!(items.len(), 2);
+            for item in &items {
+                assert_literal(key_of(item), name);
+            }
+        }
+    }
+
+    #[test]
+    fn a_member_list_shows_ids_and_names_literally() {
+        for name in HOSTILE {
+            let mut p = ChatClientProvider::new().with_sync_disabled();
+            p.access_token = "t".to_owned();
+            seed_room(&mut p, "!r:s", "Room");
+            {
+                let mut cache = p.sync_cache.lock().unwrap();
+                let room = cache.rooms.get_mut("!r:s").unwrap();
+                room.members.insert(
+                    "@a:s".to_owned(),
+                    sync::Member {
+                        user_id: "@a:s".to_owned(),
+                        display_name: Some(name.to_owned()),
+                        membership: "join".to_owned(),
+                    },
+                );
+                room.members.insert(
+                    name.to_owned(),
+                    sync::Member {
+                        user_id: name.to_owned(),
+                        display_name: None,
+                        membership: "join".to_owned(),
+                    },
+                );
+            }
+            p.push_path("Room");
+            p.push_path("[members]");
+            let items = p.fetch();
+            let with_name = format!("@a:s ({name})");
+            assert_literal(row_showing(&items, &with_name), &with_name);
+            assert_literal(row_showing(&items, name), name);
+        }
+    }
+
+    #[test]
+    fn a_public_room_is_shown_literally_and_can_be_joined_from_its_row() {
+        for name in HOSTILE {
+            let (rt, server) = start_mock_server();
+            mount(
+                &rt,
+                &server,
+                Mock::given(method("POST")).respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "room_id": "!r:s" })),
+                ),
+            );
+            let mut p = provider_for(&server);
+            p.public_rooms_cache = vec![(name.to_owned(), name.to_owned())];
+            p.push_path("[public]");
+            let items = p.fetch();
+            assert_literal(key_of(&items[0]), name);
+
+            // The app hands a command the row as it was written.
+            let raw = key_of(&items[0]).to_owned();
+            let mut error = String::new();
+            let joined = p
+                .handle_command("join public room", &raw, 1, &mut error)
+                .expect("joined");
+            assert_eq!(error, "");
+            let shown = format!("joined {name}");
+            assert_literal(key_of(&joined), &shown);
+
+            // Directly: a name with a slash is more than one path segment.
+            let detail = p.fetch_public_room_detail(name);
+            let id = format!("room id: {name}");
+            assert_literal(row_showing(&detail, &id), &id);
+        }
+    }
+
+    #[test]
+    fn an_invite_is_found_from_its_escaped_row() {
+        let (rt, server) = start_mock_server();
+        mount(
+            &rt,
+            &server,
+            Mock::given(method("POST")).respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "room_id": "!i:s" })),
+            ),
+        );
+        let mut p = provider_for(&server);
+        let key = format!("[invite] {}", HOSTILE[0]);
+        p.cache()
+            .invite_display_to_id
+            .insert(key.clone(), "!i:s".to_owned());
+        let mut error = String::new();
+        let out = p.handle_command("accept invite", &tags::escape(&key), 1, &mut error);
+        assert_eq!(error, "");
+        assert!(out.is_some());
+    }
+
+    #[test]
+    fn a_member_is_found_from_an_escaped_row() {
+        let (rt, server) = start_mock_server();
+        mount(
+            &rt,
+            &server,
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({}))),
+        );
+        let mut p = provider_for(&server);
+        seed_room(&mut p, "!r:s", "Room");
+        p.push_path("Room");
+        p.push_path("[members]");
+        let mut error = String::new();
+        let out = p
+            .handle_command("unban member", r"@\<b\>:s", 1, &mut error)
+            .expect("a confirmation");
+        assert_eq!(error, "");
+        assert_literal(key_of(&out), "unbanned @<b>:s");
+    }
+
+    #[test]
+    fn room_info_and_members_of_are_literal() {
+        for text in HOSTILE {
+            let mut p = ChatClientProvider::new().with_sync_disabled();
+            p.access_token = "t".to_owned();
+            seed_room(&mut p, "!r:s", text);
+            p.cache().rooms.get_mut("!r:s").unwrap().topic = Some(text.to_owned());
+            // Set directly: a name with a slash is more than one path segment.
+            p.current_path = format!("/{}", text.replace('/', ""));
+            p.cache()
+                .display_to_id
+                .insert(text.replace('/', ""), "!r:s".to_owned());
+            let mut error = String::new();
+            let info = p
+                .handle_command("room info", "", 0, &mut error)
+                .expect("the info");
+            let shown = format!("room id: !r:s | topic: {text} | type: room");
+            assert_literal(key_of(&info), &shown);
+
+            let members = p
+                .handle_command("members", "", 0, &mut error)
+                .expect("the row");
+            let shown = format!("members of {}", text.replace('/', ""));
+            assert_literal(key_of(&members), &shown);
+            assert_eq!(error, "");
+        }
+    }
+
+    #[test]
+    fn sign_in_messages_quote_the_server_literally() {
+        let (rt, server) = start_mock_server();
+        mount(
+            &rt,
+            &server,
+            Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({
+                    "access_token": "t",
+                    "user_id": "<img src=\"/etc/passwd\">",
+                }),
+            )),
+        );
+        let mut p = provider_for(&server);
+        p.access_token.clear();
+        p.username = "a".to_owned();
+        p.password = "b".to_owned();
+        let mut error = String::new();
+        let row = p
+            .handle_command("login", "", 0, &mut error)
+            .expect("the row");
+        assert_eq!(error, "");
+        assert_literal(key_of(&row), r#"logged in as <img src="/etc/passwd">"#);
+    }
+
+    /// The login and register forms' fields, with what they hold shown literally, and
+    /// an error quoting the server shown as a row of its own.
+    #[test]
+    fn the_forms_hold_values_and_errors_literally() {
+        for value in HOSTILE.into_iter().filter(|v| !v.ends_with('\\')) {
+            let mut p = ChatClientProvider::new().with_sync_disabled();
+            p.homeserver = value.to_owned();
+            p.username = value.to_owned();
+            p.email = value.to_owned();
+            p.password = value.to_owned();
+            for register in [false, true] {
+                p.register_mode = register;
+                if register {
+                    p.register_error = Some(value.to_owned());
+                } else {
+                    p.last_error = Some(value.to_owned());
+                }
+                let items = p.fetch();
+                let error = format!("Error: {value}");
+                assert_literal(row_showing(&items, &error), &error);
+
+                let mut fields = 0;
+                for row in items.iter().map(key_of) {
+                    if tags::has_button(row) {
+                        continue;
+                    }
+                    if let Some(raw) = tags::extract_input(row) {
+                        fields += 1;
+                        assert_eq!(escape::unescape(&raw), value, "{row:?}");
+                        assert!(tags::has_input(row), "{row:?}");
+                        assert!(!sicompass_sdk::markup::has_markup(row), "{row:?}");
+                        assert!(sicompass_sdk::markup::targets(row).is_empty(), "{row:?}");
+                    }
+                }
+                assert_eq!(fields, if register { 4 } else { 3 });
+            }
+        }
+    }
+
+    /// What the mock homeserver was sent as the body of each message.
+    fn sent_bodies(rt: &tokio::runtime::Runtime, server: &MockServer) -> Vec<String> {
+        rt.block_on(server.received_requests())
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                body["body"].as_str().unwrap().to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_sent_message_goes_out_as_typed() {
+        let (rt, server) = start_mock_server();
+        mount(
+            &rt,
+            &server,
+            Mock::given(method("PUT")).respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "event_id": "$x" })),
+            ),
+        );
+        let mut p = provider_for(&server);
+        seed_room(&mut p, "!r:s", "Room");
+        p.push_path("Room");
+        for text in HOSTILE {
+            assert!(p.commit_edit("", text), "{text:?}");
+        }
+        assert_eq!(sent_bodies(&rt, &server), HOSTILE);
+    }
+
+    /// A send that failed leaves a draft: shown escaped in its field, kept plain, and
+    /// sent as typed once the server is back.
+    #[test]
+    fn a_draft_round_trips_through_its_row_and_the_second_send() {
+        for text in HOSTILE {
+            let (rt, server) = start_mock_server();
+            let mut p = provider_for(&server);
+            seed_room(&mut p, "!r:s", "Room");
+            p.push_path("Room");
+
+            // No mock mounted: the server answers 404.
+            assert!(!p.commit_edit("", text));
+            assert_eq!(p.drafts.get("Room").map(String::as_str), Some(text));
+            let items = p.fetch();
+            let row = key_of(items.last().unwrap()).to_owned();
+            assert!(!sicompass_sdk::markup::has_markup(&row), "{row:?}");
+            assert!(sicompass_sdk::markup::targets(&row).is_empty(), "{row:?}");
+            assert_eq!(tags::strip_display(&row), text);
+            let raw = tags::extract_input(&row).expect("the field");
+            assert_eq!(escape::unescape(&raw), text);
+
+            // Enter on the field: the app passes the raw value as both.
+            mount(
+                &rt,
+                &server,
+                Mock::given(method("PUT")).respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "event_id": "$x" })),
+                ),
+            );
+            assert!(p.commit_edit(&raw, &raw), "{text:?}");
+            assert_eq!(
+                sent_bodies(&rt, &server).last().map(String::as_str),
+                Some(text)
+            );
+            assert!(!p.drafts.contains_key("Room"));
+        }
+    }
+
+    /// A value is plain wherever it goes: a form field typed into, a room name asked
+    /// for by a command.
+    #[test]
+    fn a_form_field_and_a_pending_action_take_the_typed_value() {
+        let (rt, server) = start_mock_server();
+        mount(
+            &rt,
+            &server,
+            Mock::given(method("POST")).respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "room_id": "!n:s" })),
+            ),
+        );
+        let mut p = provider_for(&server);
+        let mut error = String::new();
+        p.handle_command("create private room", "", 0, &mut error);
+        assert!(p.commit_edit("", "<b>room</b>"));
+        let requests = rt.block_on(server.received_requests()).unwrap_or_default();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["name"], "<b>room</b>");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = ChatClientProvider::new()
+            .with_sync_disabled()
+            .with_config_path(dir.path().join("chat.json"));
+        p.push_path("Username");
+        assert!(p.commit_edit("", r"<b>\"));
+        assert_eq!(p.username, r"<b>\");
+        let raw = r"\<b\>";
+        assert!(p.commit_edit(raw, raw));
+        assert_eq!(p.username, "<b>");
+    }
+
+    /// Reported, not worked around: the SDK's scanner reads `\</input>` as an escaped
+    /// closing tag, so a value ending in a backslash leaves a row that shows and reads
+    /// back correctly and makes nothing live, but which the app does not take for a
+    /// field. See the ignored test below for what it should be.
+    #[test]
+    fn a_value_ending_in_a_backslash_is_inert_and_reads_back() {
+        let text = r"ends in a backslash\";
+        let row = tags::format_input(&tags::escape(text));
+        assert!(!sicompass_sdk::markup::has_markup(&row));
+        assert!(sicompass_sdk::markup::targets(&row).is_empty());
+        assert_eq!(tags::strip_display(&row), text);
+        assert_eq!(escape::unescape(&tags::extract_input(&row).unwrap()), text);
+    }
+
+    #[test]
+    fn a_value_ending_in_a_backslash_is_still_a_field() {
+        let row = tags::format_input(&tags::escape(r"ends in a backslash\"));
+        assert!(tags::has_input(&row), "{row:?}");
     }
 }
 
