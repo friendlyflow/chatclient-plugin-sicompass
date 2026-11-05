@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+- Everything a room or a stranger writes is shown exactly as written, never read as markup, and a sent message keeps its own bytes.
+- Needs sicompass 0.2.4.
+- Intel macs are not built any more.
+
 ## 0.3.1
 
 - Maintenance release. Nothing changes in the plugin itself.
